@@ -1340,9 +1340,7 @@ def _get_is_default_transport():
             determine_tensor_transport_mode,
         )
 
-        _is_default_tensor_transport = (
-            determine_tensor_transport_mode(get_server_args()) == "default"
-        )
+        _is_default_tensor_transport = determine_tensor_transport_mode() == "default"
     return _is_default_tensor_transport
 
 

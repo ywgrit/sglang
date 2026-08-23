@@ -486,7 +486,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
             _processor = get_processor_wrapper(server_args)
-            transport_mode = determine_tensor_transport_mode(self.server_args)
+            transport_mode = determine_tensor_transport_mode()
 
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode
@@ -662,9 +662,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         # Keep a reference so the bootstrap server is not garbage-collected.
         self.bootstrap_server = (
-            start_disagg_service(self.server_args)
-            if start_pd_bootstrap_service
-            else None
+            start_disagg_service() if start_pd_bootstrap_service else None
         )
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
@@ -760,7 +758,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
             ]
         )
-        self.init_communicators(self.server_args)
+        self.init_communicators()
 
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
@@ -3598,7 +3596,7 @@ def get_processor_wrapper(server_args):
     )
 
 
-def determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+def determine_tensor_transport_mode() -> TensorTransportMode:
     is_cross_node = get_parallel().config.dist_init_addr
 
     if is_cross_node:
