@@ -1193,7 +1193,6 @@ class ModelRunner:
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(
             self.model,
-            self.server_args,
             self.model_config,
             logger,
         )
