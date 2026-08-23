@@ -189,10 +189,12 @@ def main():
         server_args.resolve_once()
     router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
 
-    # Find available ports for workers
-    worker_ports = find_available_ports(
-        args.router_dp_worker_base_port, server_args.dp_size
-    )
+    # Find available ports for workers. `dp_size` is resolution's answer
+    # (`--dwdp-size` fills it), and the record is the operator's input, so the
+    # count comes from the resolved projection where the wheel exposes one.
+    resolved = getattr(server_args, "resolved_dict", None)
+    dp_size = resolved()["dp_size"] if resolved is not None else server_args.dp_size
+    worker_ports = find_available_ports(args.router_dp_worker_base_port, dp_size)
 
     # Start server processes
     server_processes = []

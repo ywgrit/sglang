@@ -5,13 +5,11 @@ so a resolution write that only assigns the field is invisible to it. Every
 resolver declares now -- the record's handlers through `self._declare`, the
 hooks and hardware defaults through `declare_resolution` -- and that is pinned
 two ways: no bare assignment to a field survives anywhere a ServerArgs instance
-is in reach, and after resolution every declared field agrees with what the
-stash says. The second check is the one that keeps the transition honest --
-while a declaration still writes the field immediately, a stash entry and a
-field can only disagree if something assigned the field behind the stash's
-back. A third check runs the other way: every field resolution moved has to
-be explained by the stash, which covers the spellings a source scan cannot
-see.
+is in reach, and after resolution `resolution_result` answers for every declared
+field with what the stash holds. The second check is what the stash is measured
+against: the two can disagree only if something wrote behind the stash's back. A
+third check runs the other way -- every field resolution moved has to be
+explained by the stash, which covers the spellings a source scan cannot see.
 """
 
 import ast
@@ -574,10 +572,9 @@ class TestResolutionDeclarations(CustomTestCase):
 
         The parser detection and the LoRA normalization run at launcher stage --
         they need a tokenizer, a chat template, an adapter directory -- and they
-        write through `declare_late_resolution`. If those writes only reached
-        the fields, the bags would describe the *unresolved* value: a server
-        launched with `--reasoning-parser auto` would advertise and apply
-        `auto` after detection had already replaced it.
+        declare through `declare_late_resolution`. The declaration is the only
+        home for what they decide: the record keeps `--reasoning-parser auto`,
+        and the bags a process publishes carry the detected parser.
 
         A real model path, not the dummy one: a dummy record never materializes,
         so its `resolve_once` re-runs and re-snapshots the raw input from
@@ -599,15 +596,22 @@ class TestResolutionDeclarations(CustomTestCase):
         )
         publish(server_args, role="tokenizer")
         self.assertEqual(get_serving().reasoning_parser, "qwen3")
-        self.assertEqual(server_args.reasoning_parser, get_serving().reasoning_parser)
+        self.assertEqual(
+            server_args.reasoning_parser,
+            "auto",
+            "the record is the operator's input; late resolution declares, it "
+            "does not write back",
+        )
 
     def test_validation_can_still_resolve_before_the_record_is_published(self):
-        """The LoRA checks normalize in place, so they must precede publish.
+        """The LoRA checks resolve, so they must precede publish.
 
         `check_server_args` is not read-only: it infers `enable_lora`, parses
         adapter paths and normalizes target modules through late resolution,
         which a published record refuses. The launcher order is what keeps this
-        legal, and this is the assertion that notices if it moves.
+        legal, and this is the assertion that notices if it moves. What those
+        declarations decide reaches the bags; the record keeps the raw form the
+        operator passed.
         """
         from sglang.srt.runtime_context import get_lora, publish, reset_context
 
@@ -621,9 +625,17 @@ class TestResolutionDeclarations(CustomTestCase):
         self.addCleanup(reset_context)
         server_args.check_server_args()
         publish(server_args, role="tokenizer")
-        self.assertEqual(get_lora().enable_lora, server_args.enable_lora)
         self.assertEqual(
-            get_lora().lora_target_modules, server_args.lora_target_modules
+            get_lora().enable_lora, resolution_result(server_args, "enable_lora")
+        )
+        self.assertEqual(
+            get_lora().lora_target_modules,
+            resolution_result(server_args, "lora_target_modules"),
+        )
+        self.assertEqual(
+            server_args.lora_target_modules,
+            ["q_proj"],
+            "normalization is a declaration; the record keeps what was passed",
         )
 
     def test_the_launcher_finishes_resolving_before_it_publishes(self):
