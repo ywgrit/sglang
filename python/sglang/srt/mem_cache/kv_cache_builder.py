@@ -122,7 +122,7 @@ def _register_legacy_hicache_draft(
         host_size=0,
         page_size=page_size,
         layout=get_memory().hicache_mem_layout,
-        allocator_type=server_args.hicache_storage_backend,
+        allocator_type=get_memory().hicache_storage_backend,
         pool_label="draft",
     )
     if isinstance(pool, MHATokenToKVPool):
