@@ -410,7 +410,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_args = server_args
         ensure_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
-        self.elastic_worker_count = get_parallel().dp_size
+        self.elastic_worker_count = get_parallel().config.dp_size
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
@@ -1547,7 +1547,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return batch_size > 0 and (
             get_serving().enable_tokenizer_batch_encode
             or (
-                (not get_parallel().enable_dp_attention)
+                (not get_parallel().config.enable_dp_attention)
                 and (not self._batch_has_text(batch_size, requests))
             )
         )
@@ -3599,7 +3599,7 @@ def get_processor_wrapper(server_args):
 
 
 def determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
-    is_cross_node = get_parallel().dist_init_addr
+    is_cross_node = get_parallel().config.dist_init_addr
 
     if is_cross_node:
         # Fallback to default CPU transport for multi-node
