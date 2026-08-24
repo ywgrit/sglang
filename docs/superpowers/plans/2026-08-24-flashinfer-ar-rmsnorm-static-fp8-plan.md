@@ -466,6 +466,20 @@ It then invokes the private custom op. Fallback is legal only here, before the
 private op/collective is entered. This split is required because the registered
 op schema cannot declare Tensor outputs and then return `(None, None, None)`.
 
+Workspace reuse requires a complete identity match: world size, local group
+rank, exact `(device_group, cpu_group)`, backend, dtype, and sufficient
+capacity. Check these identity fields before calling the backend's opaque size
+validator; a same-sized workspace created for different peers must be
+destroyed and recreated.
+
+During `torch.compile`/FakeTensor tracing, never call
+`ensure_workspace_initialized` or either workspace size validator. Startup has
+already preinitialized the allocation, so inspect only cached Python metadata
+and static capacity bounds. In eager mode, `ensure_workspace_initialized=False`
+is still a legal prelaunch fallback; once it returns true, a missing or
+identity-mismatched manager is an invariant error and must raise rather than
+letting one rank fall back after workspace collectives.
+
 Inside the private op, allocate outputs as in the fake. Select:
 
 ```python
