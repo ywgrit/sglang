@@ -36,14 +36,15 @@ except ImportError:
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class _Linear:
+class _Linear(torch.nn.Module):
     def __init__(self, quant_method=None, input_scale=None, output=None):
+        super().__init__()
         self.quant_method = quant_method
         self.input_scale = input_scale
         self.output = output
         self.inputs = []
 
-    def __call__(self, hidden_states):
+    def forward(self, hidden_states):
         self.inputs.append(hidden_states)
         return self.output, None
 
@@ -238,7 +239,10 @@ class TestQwen35FusedArTupleSelector(unittest.TestCase):
 
 
 class TestQwen35GdnFusedArRouting(unittest.TestCase):
-    def _run_input_projection(self, fused, qkv_linear):
+    def _run_input_projection(
+        self, fused, qkv_linear, *, backend, use_aiter
+    ):
+        self.assertIn(backend, ("cuda", "amd"))
         qkv_linear.output = torch.randn(2, 6)
         ba = _Linear(output=torch.randn(2, 2))
         # Bypass the heavyweight constructor while retaining class method
@@ -250,7 +254,9 @@ class TestQwen35GdnFusedArRouting(unittest.TestCase):
         gdn.alt_stream = None
         with mock.patch.multiple(
             qwen35,
-            _use_aiter=False,
+            _is_cuda=(backend == "cuda"),
+            _is_hip=(backend == "amd"),
+            _use_aiter=use_aiter,
             _is_cpu=False,
             _is_npu=False,
             _gdn_use_alt_stream=False,
@@ -264,7 +270,12 @@ class TestQwen35GdnFusedArRouting(unittest.TestCase):
         scale = torch.tensor([0.125])
         fused = (bf16, fp8, scale, torch.bfloat16)
 
-        projected, qkv, ba = self._run_input_projection(fused, _static_linear())
+        projected, qkv, ba = self._run_input_projection(
+            fused,
+            _static_linear(),
+            backend="cuda",
+            use_aiter=False,
+        )
 
         self.assertIs(qkv.inputs[0][0], fp8)
         self.assertIs(qkv.inputs[0][1], scale)
@@ -279,7 +290,12 @@ class TestQwen35GdnFusedArRouting(unittest.TestCase):
         scale = torch.ones(2, 1)
         fused = (bf16, fp8, scale)
 
-        _, qkv, ba = self._run_input_projection(fused, _group_linear(block=True))
+        _, qkv, ba = self._run_input_projection(
+            fused,
+            _group_linear(block=True),
+            backend="amd",
+            use_aiter=True,
+        )
 
         self.assertIs(qkv.inputs[0][0], fp8)
         self.assertIs(qkv.inputs[0][1], scale)
@@ -480,6 +496,31 @@ class TestQwen35FusedArRegistration(unittest.TestCase):
 
         self.assertTrue(decision["enable_fused_ar_quant"])
         self.assertIs(decision["fused_ar_quant_linear"], qkv_proj)
+
+    def test_backend_and_consumer_must_match_exactly(self):
+        cases = [
+            ("CUDA rejects group consumer", _group_linear(block=True), True, False),
+            ("AMD rejects static consumer", _static_linear(), False, True),
+            ("no backend rejects static consumer", _static_linear(), False, False),
+            (
+                "no backend rejects group consumer",
+                _group_linear(block=True),
+                False,
+                False,
+            ),
+        ]
+        for name, linear, cuda, aiter in cases:
+            with self.subTest(name=name):
+                decision = self._decision(
+                    linear,
+                    keep_bf16=aiter,
+                    cuda=cuda,
+                    aiter=aiter,
+                )
+
+                self.assertEqual(set(decision), self.EXPECTED_KEYS)
+                self.assertFalse(decision["enable_fused_ar_quant"])
+                self.assertIsNone(decision["fused_ar_quant_linear"])
 
     def test_backend_neutral_opt_out_disables_cuda_and_amd(self):
         cases = [
