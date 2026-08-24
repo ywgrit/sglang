@@ -392,6 +392,46 @@ def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
     return input_scale
 
 
+def _forward_with_allreduce_fusion_static_fp8_quant(
+    norm_module,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    quant_linear,
+    use_attn_tp_group: bool = True,
+    keep_bf16: bool = False,
+):
+    """Fuse allreduce, residual RMSNorm, and static per-tensor FP8 quant."""
+    if residual is None:
+        return None
+
+    scale = _fp8_static_input_scale(quant_linear)
+    if scale is None:
+        return None
+
+    from sglang.srt.layers.flashinfer_comm_fusion import (
+        try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant,
+    )
+
+    quant_out, residual_out, norm_out = (
+        try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+            input_tensor=x,
+            residual=residual,
+            weight=weight,
+            scale_factor=scale,
+            eps=norm_module.variance_epsilon,
+            max_token_num=max(x.shape[0], 2048),
+            use_attn_tp_group=use_attn_tp_group,
+            keep_bf16=keep_bf16,
+        )
+    )
+    if quant_out is None:
+        return None
+    if keep_bf16:
+        return (norm_out, quant_out, scale, x.dtype), residual_out
+    return (quant_out, scale, x.dtype), residual_out
+
+
 def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
     input_scale = getattr(linear, "input_scale", None)
     if input_scale is None:
@@ -917,6 +957,25 @@ class RMSNorm(BaseFusedOp):
             self, x, residual, self.weight, group_size, use_attn_tp_group, keep_bf16
         )
 
+    def forward_with_allreduce_fusion_static_fp8_quant(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
+        use_attn_tp_group: bool = True,
+        keep_bf16: bool = False,
+    ):
+        """Fused AR + RMSNorm + static per-tensor FP8 quantization."""
+        return _forward_with_allreduce_fusion_static_fp8_quant(
+            self,
+            x,
+            residual,
+            self.weight,
+            quant_linear,
+            use_attn_tp_group,
+            keep_bf16,
+        )
+
     def forward_with_per_tensor_quant_fusion(
         self,
         x: torch.Tensor,
@@ -1251,7 +1310,7 @@ class GemmaRMSNorm(BaseFusedOp):
             residual,
             post_residual_addition,
             self.gemma_weight,
-            use_attn_tp_group=True,
+            use_attn_tp_group=use_attn_tp_group,
         )
 
     def forward_with_allreduce_fusion_quant_per_group(
@@ -1269,6 +1328,25 @@ class GemmaRMSNorm(BaseFusedOp):
             residual,
             self.gemma_weight,
             group_size,
+            use_attn_tp_group,
+            keep_bf16,
+        )
+
+    def forward_with_allreduce_fusion_static_fp8_quant(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
+        use_attn_tp_group: bool = True,
+        keep_bf16: bool = False,
+    ):
+        """Fused AR + Gemma RMSNorm + static per-tensor FP8 quantization."""
+        return _forward_with_allreduce_fusion_static_fp8_quant(
+            self,
+            x,
+            residual,
+            self.gemma_weight,
+            quant_linear,
             use_attn_tp_group,
             keep_bf16,
         )
