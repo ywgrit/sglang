@@ -11,6 +11,7 @@
 ## Non-negotiable contracts
 
 - Scope the first PR to Qwen3.5. Do not advertise NemotronH support until its consumer tuple contract is independently verified.
+- The roadmap's Qwen3.5-V2 target uses `ModelOptFp8LinearMethod`. Supporting only native `Fp8LinearMethod` or compressed-tensors is not completion: ModelOpt must both expose its scalar scale to the producer and consume pre-quantized tuple input without launching `static_quant_fp8` again.
 - Use `kARResidualRMSNormFP8Quant` for full-attention QKV, with no BF16 norm output.
 - Use `kARResidualRMSNormOutFP8Quant` for GDN, because `in_proj_qkvz` consumes FP8 while `in_proj_ba` consumes BF16.
 - Preserve Gemma semantics by passing `GemmaRMSNorm.gemma_weight` and leaving FlashInfer `weight_bias=0.0`. Never add one twice.
@@ -410,6 +411,113 @@ git add python/sglang/srt/layers/flashinfer_comm_fusion.py
 git commit -m "feat: fuse FlashInfer allreduce RMSNorm and static FP8 quant"
 ```
 
+### Task 5A: Add ModelOpt FP8 pre-quantized input support
+
+**Files:**
+- Modify: `test/registered/unit/layers/quantization/test_fp8_blockwise_linear_backends.py`
+- Modify: `python/sglang/srt/layers/quantization/modelopt_quant.py:610-658`
+- Modify: `python/sglang/srt/layers/layernorm.py:370-425`
+
+This is required by #31504's primary Qwen3.5-V2/ModelOpt target. The norm-level fusion merged in #33471 taught native and compressed-tensors linears to consume tuples, but current `ModelOptFp8LinearMethod.apply` still accepts only a tensor and launches its own static quantization.
+
+**Step 1: Add a failing ModelOpt dispatch test**
+
+Extend `TestModeloptFp8PerTensorLinear` with a CUDA test that builds one processed ModelOpt layer, quantizes an input once, then calls:
+
+```python
+actual, _ = layer((qinput, layer.input_scale, torch.bfloat16))
+```
+
+Patch or instrument `static_quant_fp8` and assert it is not called from the linear method. Compare the output against the ordinary BF16-input path and require the same shape/dtype with the existing FP8 tolerance.
+
+Add a small mock-based CPU-discoverable unit if the real test cannot prove dispatch independently of hardware:
+
+```python
+with patch.object(modelopt_quant, "apply_fp8_linear") as apply:
+    method.apply(layer, (qinput, scale, torch.bfloat16))
+    apply.assert_called_once_with(
+        input=qinput,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        input_scale=scale,
+        bias=None,
+        cutlass_fp8_supported=method.cutlass_fp8_supported,
+        pre_quant_output_dtype=torch.bfloat16,
+    )
+```
+
+Test that Marlin rejects/is ineligible for tuple production, because Marlin deletes `input_scale` and consumes unquantized activations.
+
+**Step 2: Run RED**
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/registered/unit/layers/quantization/test_fp8_blockwise_linear_backends.py \
+  -k 'Modelopt and prequant'
+```
+
+Expected: failure because `ModelOptFp8LinearMethod.apply` treats the tuple as a tensor.
+
+**Step 3: Implement tuple consumption before all ModelOpt special paths**
+
+At the top of `ModelOptFp8LinearMethod.apply`, before Marlin, SM120 GEMV, and FlashInfer BMM dispatch:
+
+```python
+if isinstance(x, tuple):
+    qx, x_scale = x[0], x[1]
+    out_dtype = x[2] if len(x) > 2 else None
+    return apply_fp8_linear(
+        input=qx,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        input_scale=x_scale,
+        bias=bias,
+        cutlass_fp8_supported=self.cutlass_fp8_supported,
+        pre_quant_output_dtype=out_dtype,
+    )
+```
+
+This deliberately bypasses `apply_fp8_linear_bmm_flashinfer`, whose current implementation begins by calling `static_quant_fp8` on a BF16 tensor. It also bypasses the SM120 GEMV branch, which likewise quantizes internally. Benchmark this dispatch choice later; correctness and removal of the standalone quant kernel come first.
+
+Validate that `apply_fp8_linear` accepts `pre_quant_output_dtype` on the pinned SGLang base before committing.
+
+**Step 4: Recognize ModelOpt as a static per-tensor consumer**
+
+Extend `_is_static_per_tensor_fp8_linear`:
+
+```python
+try:
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        ModelOptFp8LinearMethod,
+    )
+except ImportError:
+    ModelOptFp8LinearMethod = ()
+if isinstance(quant_method, ModelOptFp8LinearMethod):
+    return not getattr(quant_method, "use_marlin", False)
+```
+
+The existing `_fp8_static_input_scale` scalar check remains authoritative after this class check.
+
+**Step 5: Run GREEN and the existing ModelOpt backend test**
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/registered/unit/layers/quantization/test_fp8_blockwise_linear_backends.py \
+  -k 'Modelopt'
+```
+
+Expected: ordinary and pre-quantized ModelOpt cases pass on SM90+.
+
+**Step 6: Commit**
+
+```bash
+git add \
+  python/sglang/srt/layers/quantization/modelopt_quant.py \
+  python/sglang/srt/layers/layernorm.py \
+  test/registered/unit/layers/quantization/test_fp8_blockwise_linear_backends.py
+git commit -m "feat: let ModelOpt FP8 linears consume fused quant input"
+```
+
 ## LayerNorm and communicator integration
 
 ### Task 6: Add failing LayerNorm tuple-contract tests
@@ -422,6 +530,7 @@ git commit -m "feat: fuse FlashInfer allreduce RMSNorm and static FP8 quant"
 
 Build minimal fake linears with:
 
+- `ModelOptFp8LinearMethod`, static scalar `input_scale` -> eligible (primary roadmap target);
 - native `Fp8LinearMethod`, static scalar `input_scale` -> eligible;
 - compressed-tensors static W8A8 scalar scale -> eligible when importable;
 - block/MXFP8/Marlin/dynamic/no scale/vector scale -> ineligible.
@@ -666,6 +775,8 @@ _linear_accepts_group_fp8_tuple(linear)  # existing block/MXFP8 behavior
 _linear_accepts_static_fp8_tuple(linear) # delegates to _fp8_static_input_scale
 ```
 
+The static predicate must be true for ModelOpt FP8, native per-tensor FP8, and compatible compressed-tensors static W8A8 FP8; it must be false for Marlin, block/MXFP8, dynamic, and vector-scale consumers.
+
 Do not broaden the old AMD predicate and accidentally pass a 4-tuple to block-FP8 code.
 
 **Step 2: Test full-attention routing**
@@ -825,16 +936,19 @@ python -m compileall -q \
   python/sglang/srt/layers/layernorm.py \
   python/sglang/srt/layers/communicator.py \
   python/sglang/srt/models/qwen3_5.py \
+  python/sglang/srt/layers/quantization/modelopt_quant.py \
   benchmark/kernels/bench_flashinfer_allreduce_rmsnorm_fp8_quant.py
 ruff check \
   python/sglang/srt/layers/flashinfer_comm_fusion.py \
   python/sglang/srt/layers/layernorm.py \
   python/sglang/srt/layers/communicator.py \
   python/sglang/srt/models/qwen3_5.py \
+  python/sglang/srt/layers/quantization/modelopt_quant.py \
   test/registered/unit/layers/test_flashinfer_comm_fusion.py \
   test/registered/unit/layers/test_layernorm_allreduce_fp8_quant.py \
   test/registered/unit/layers/test_layer_communicator_fusion_gate.py \
   test/registered/unit/models/test_qwen3_5_fused_ar_quant.py \
+  test/registered/unit/layers/quantization/test_fp8_blockwise_linear_backends.py \
   benchmark/kernels/bench_flashinfer_allreduce_rmsnorm_fp8_quant.py
 ```
 
