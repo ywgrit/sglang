@@ -4,7 +4,7 @@
 
 **Goal:** Implement SGLang roadmap issue #31504 Step 3 for Qwen3.5 on NVIDIA Hopper/Blackwell: fuse tensor-parallel AllReduce, residual addition, Gemma RMSNorm, and static per-tensor FP8 activation quantization, while preserving an optional BF16 side output for GDN layers.
 
-**Architecture:** Add a fail-closed FlashInfer quant-fusion capability probe beside the existing unified AllReduce probe. Add one custom-op wrapper that selects FlashInfer pattern 2 (quant-only) or pattern 4 (BF16 + quant), returning tensor-only outputs. LayerNorm translates those tensors into the tuple contracts already accepted by SGLang FP8 linears. `LayerCommunicator` selects the CUDA static-FP8 path only when its exact downstream linear has a scalar static input scale; otherwise it keeps the existing plain AllReduce + RMSNorm path. Qwen3.5 registers the exact consumer linear and handles AMD per-group and CUDA per-tensor tuples separately.
+**Architecture:** Add a fail-closed FlashInfer quant-fusion capability probe beside the existing unified AllReduce probe. Add one custom-op wrapper that selects FlashInfer pattern 2 (quant-only) or pattern 4 (BF16 + quant), returning tensor-only outputs. LayerNorm translates those tensors into the tuple contracts already accepted by SGLang FP8 linears. Qwen3.5 registers a consumer during construction based on quant-method capability (before ModelOpt scales are finalized); `LayerCommunicator` and LayerNorm validate the finalized scalar scale immediately before dispatch. Ineligible or not-yet-ready consumers retain the existing plain AllReduce + RMSNorm path. AMD per-group and CUDA per-tensor tuple contracts remain separate.
 
 **Tech Stack:** Python 3.10+, PyTorch custom ops/FakeTensor, FlashInfer `comm.allreduce_fusion`, SGLang `LayerCommunicator`, unittest/pytest, CUDA Graph capture, NCCL TP=2, NVIDIA H20/H100/H200.
 
@@ -528,14 +528,24 @@ git commit -m "feat: let ModelOpt FP8 linears consume fused quant input"
 
 **Step 1: Test static consumer discovery**
 
+Test two deliberately separate decisions:
+
+1. Construction-time consumer capability via `_is_static_per_tensor_fp8_linear`.
+2. Forward-time readiness via `_fp8_static_input_scale`.
+
 Build minimal fake linears with:
 
-- `ModelOptFp8LinearMethod`, static scalar `input_scale` -> eligible (primary roadmap target);
+- `ModelOptFp8LinearMethod`, pre-load vector `input_scale` -> consumer-capable but not forward-ready;
+- the same ModelOpt linear after scale finalization to one element -> consumer-capable and forward-ready;
 - native `Fp8LinearMethod`, static scalar `input_scale` -> eligible;
 - compressed-tensors static W8A8 scalar scale -> eligible when importable;
-- block/MXFP8/Marlin/dynamic/no scale/vector scale -> ineligible.
+- block/MXFP8/Marlin/dynamic/no scale -> consumer-ineligible;
+- otherwise-compatible vector scale -> consumer-capable but not forward-ready.
 
-Reuse `_fp8_static_input_scale` rather than duplicating its classification logic.
+This distinction is mandatory because ModelOpt creates one scale per packed
+partition and collapses it to a scalar only in
+`process_weights_after_loading`. A constructor-time `numel() == 1` gate would
+permanently disable the target path.
 
 **Step 2: Test the quant-only contract**
 
@@ -772,10 +782,15 @@ The tests require two predicates:
 
 ```python
 _linear_accepts_group_fp8_tuple(linear)  # existing block/MXFP8 behavior
-_linear_accepts_static_fp8_tuple(linear) # delegates to _fp8_static_input_scale
+_linear_accepts_static_fp8_tuple(linear) # quant-method capability only
 ```
 
-The static predicate must be true for ModelOpt FP8, native per-tensor FP8, and compatible compressed-tensors static W8A8 FP8; it must be false for Marlin, block/MXFP8, dynamic, and vector-scale consumers.
+The static predicate delegates to `_is_static_per_tensor_fp8_linear` and must
+be true for ModelOpt FP8 even while its pre-load `input_scale` is a vector. It
+must also recognize native per-tensor FP8 and compatible compressed-tensors
+static W8A8 FP8, and be false for Marlin, block/MXFP8, and dynamic consumers.
+It must not call `_fp8_static_input_scale`, because scale cardinality is a
+forward-time readiness property.
 
 Do not broaden the old AMD predicate and accidentally pass a 4-tuple to block-FP8 code.
 
@@ -799,6 +814,7 @@ Patch environment/runtime predicates and instantiate the smallest viable Qwen3.5
 
 - full attention registers `qkv_proj`, `keep_bf16=False`;
 - GDN registers `in_proj_qkvz`, `keep_bf16=True`;
+- a ModelOpt consumer with a pre-load vector scale is still registered;
 - CUDA static FP8 is not gated by `enable_aiter_allreduce_fusion`;
 - `SGLANG_DISABLE_FUSED_AR_QUANT=1` disables both backends as the existing user opt-out promises.
 
@@ -834,10 +850,10 @@ Keep `_enable_qwen35_fused_ar_quant()` as the AMD decision if renaming it would 
 
 - `_is_cuda` and not `_use_aiter`;
 - FlashInfer quant capability;
-- scalar static scale on the exact consumer;
+- static-FP8 tuple consumer capability on the exact quant method, without checking scale cardinality;
 - ordinary FlashInfer allreduce fusion configuration remains enabled by its existing runtime gate.
 
-Capability is an optimization gate only; do not initialize a workspace or enter a collective in the model constructor.
+Capability is an optimization gate only; do not initialize a workspace or enter a collective in the model constructor. The LayerNorm helper calls `_fp8_static_input_scale` at forward time, after `process_weights_after_loading`, and returns `None` if the scale is absent/non-scalar so the communicator takes ordinary AR+RMSNorm.
 
 **Step 2: Split tuple selectors**
 
