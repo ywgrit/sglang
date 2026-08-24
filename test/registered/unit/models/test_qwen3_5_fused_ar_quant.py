@@ -50,6 +50,12 @@ class _Linear(torch.nn.Module):
         return self.output, None
 
 
+class _ForbiddenBaProjection(_Linear):
+    def forward(self, hidden_states):
+        self.inputs.append(hidden_states)
+        raise AssertionError("BA projection ran before GDN tuple validation")
+
+
 class _TensorConsumer(torch.nn.Module):
     def __init__(self, output):
         super().__init__()
@@ -279,11 +285,12 @@ class TestQwen35FusedArTupleSelector(unittest.TestCase):
 
 class TestQwen35GdnFusedArRouting(unittest.TestCase):
     def _run_input_projection(
-        self, fused, qkv_linear, *, backend, use_aiter
+        self, fused, qkv_linear, *, backend, use_aiter, ba=None
     ):
         self.assertIn(backend, ("cuda", "amd"))
         qkv_linear.output = torch.randn(2, 6)
-        ba = _Linear(output=torch.randn(2, 2))
+        if ba is None:
+            ba = _Linear(output=torch.randn(2, 2))
         # Bypass the heavyweight constructor while retaining class method
         # lookup for the common tuple projection helper.
         gdn = qwen35.Qwen3_5GatedDeltaNet.__new__(qwen35.Qwen3_5GatedDeltaNet)
@@ -363,13 +370,16 @@ class TestQwen35GdnFusedArRouting(unittest.TestCase):
 
         for name, fused, qkv, backend, use_aiter in cases:
             with self.subTest(name=name):
+                ba = _ForbiddenBaProjection()
                 with self.assertRaisesRegex(TypeError, r"GDN.*dual-output"):
                     self._run_input_projection(
                         fused,
                         qkv,
                         backend=backend,
                         use_aiter=use_aiter,
+                        ba=ba,
                     )
+                self.assertEqual(ba.inputs, [])
 
 
 class TestQwen35DecoderFusedArTokenCount(unittest.TestCase):
