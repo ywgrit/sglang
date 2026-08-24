@@ -1,7 +1,8 @@
 import contextlib
+import inspect
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
@@ -29,6 +30,8 @@ class _FakeFlashInferComm:
     class AllReduceFusionPattern:
         kAllReduce = object()
         kARResidualRMSNorm = object()
+        kARResidualRMSNormFP8Quant = object()
+        kARResidualRMSNormOutFP8Quant = object()
 
     def __init__(self):
         self.calls = []
@@ -51,6 +54,10 @@ class _FakeFlashInferComm:
         residual_in=None,
         rms_gamma=None,
         rms_eps=None,
+        quant_out=None,
+        scale_out=None,
+        scale_factor=None,
+        weight_bias=0.0,
         **_kwargs,
     ):
         if pattern is self.AllReduceFusionPattern.kAllReduce:
@@ -73,6 +80,214 @@ class _FakeFlashInferComm:
         ).to(input.dtype)
         residual_out.copy_(expected_residual)
         norm_out.copy_(expected_norm)
+
+
+class TestFlashInferAllReduceQuantCapability(CustomTestCase):
+    def test_static_fp8_quant_capability_requires_both_patterns_and_arguments(self):
+        comm = _FakeFlashInferComm()
+        self.assertTrue(
+            fusion._supports_allreduce_rmsnorm_static_fp8_quant(comm)
+        )
+
+        for missing_pattern in (
+            "kARResidualRMSNormFP8Quant",
+            "kARResidualRMSNormOutFP8Quant",
+        ):
+            patterns = types.SimpleNamespace(
+                **{
+                    name: getattr(comm.AllReduceFusionPattern, name)
+                    for name in (
+                        "kARResidualRMSNormFP8Quant",
+                        "kARResidualRMSNormOutFP8Quant",
+                    )
+                    if name != missing_pattern
+                }
+            )
+            with self.subTest(missing_pattern=missing_pattern), patch.object(
+                comm, "AllReduceFusionPattern", patterns
+            ):
+                self.assertFalse(
+                    fusion._supports_allreduce_rmsnorm_static_fp8_quant(comm)
+                )
+
+        for missing_argument in ("quant_out", "scale_factor", "weight_bias"):
+            parameters = {
+                name: parameter
+                for name, parameter in inspect.signature(
+                    _FakeFlashInferComm.allreduce_fusion
+                ).parameters.items()
+                if name != missing_argument
+            }
+            legacy_signature = inspect.Signature(parameters.values())
+            with self.subTest(missing_argument=missing_argument), patch.object(
+                _FakeFlashInferComm.allreduce_fusion,
+                "__signature__",
+                legacy_signature,
+                create=True,
+            ):
+                self.assertFalse(
+                    fusion._supports_allreduce_rmsnorm_static_fp8_quant(comm)
+                )
+
+    def test_missing_quant_signature_does_not_disable_plain_allreduce(self):
+        class _LegacyFlashInferComm(_FakeFlashInferComm):
+            def allreduce_fusion(self, *, input, workspace, pattern, output=None):
+                return output
+
+        with patch.object(fusion, "_flashinfer_allreduce_unavailable", False):
+            self.assertFalse(
+                fusion._supports_allreduce_rmsnorm_static_fp8_quant(
+                    _LegacyFlashInferComm()
+                )
+            )
+            self.assertFalse(fusion._flashinfer_allreduce_unavailable)
+
+    def test_startup_synchronizes_capability_on_exact_group(self):
+        attn_cpu_group = object()
+        moe_tp_cpu_group = object()
+        ep_cpu_group = object()
+
+        cases = (
+            (
+                "attention_tp",
+                True,
+                1,
+                attn_cpu_group,
+                {
+                    "get_attn_tp_group": MagicMock(
+                        return_value=types.SimpleNamespace(
+                            world_size=2, cpu_group=attn_cpu_group
+                        )
+                    )
+                },
+            ),
+            (
+                "moe_tp",
+                False,
+                1,
+                moe_tp_cpu_group,
+                {
+                    "get_moe_tp_group": MagicMock(
+                        return_value=types.SimpleNamespace(
+                            world_size=2, cpu_group=moe_tp_cpu_group
+                        )
+                    )
+                },
+            ),
+            (
+                "moe_ep",
+                False,
+                2,
+                ep_cpu_group,
+                {
+                    "get_moe_ep_group": MagicMock(
+                        return_value=types.SimpleNamespace(
+                            world_size=2, cpu_group=ep_cpu_group
+                        )
+                    )
+                },
+            ),
+        )
+
+        capability_cases = (
+            ("all_available", True, False, 0, True),
+            ("remote_unavailable", True, True, 0, False),
+            ("local_unavailable", False, False, 1, False),
+        )
+        for name, use_attn_tp_group, moe_ep_size, cpu_group, group_patches in cases:
+            for (
+                capability_case,
+                local_available,
+                remote_unavailable,
+                expected_incoming_flag,
+                expected_available,
+            ) in capability_cases:
+                def emulate_collective(flag, *, op, group):
+                    self.assertEqual(flag.item(), expected_incoming_flag)
+                    self.assertIs(op, fusion.dist.ReduceOp.MAX)
+                    self.assertIs(group, cpu_group)
+                    if remote_unavailable:
+                        flag.fill_(1)
+
+                with (
+                    self.subTest(
+                        name=name, capability_case=capability_case
+                    ),
+                    patch.object(
+                        fusion,
+                        "_flashinfer_allreduce_quant_available",
+                        local_available,
+                        create=True,
+                    ),
+                    patch.object(
+                        fusion,
+                        "_flashinfer_allreduce_quant_capability_by_group",
+                        {},
+                        create=True,
+                    ),
+                    patch.object(
+                        fusion,
+                        "get_parallel",
+                        return_value=types.SimpleNamespace(moe_ep_size=moe_ep_size),
+                    ),
+                    patch.object(
+                        fusion,
+                        "get_tp_group",
+                        side_effect=AssertionError(
+                            "must use the exact coordinator"
+                        ),
+                    ),
+                    patch.multiple(fusion, **group_patches),
+                    patch.object(
+                        fusion.dist,
+                        "all_reduce",
+                        side_effect=emulate_collective,
+                    ) as all_reduce,
+                ):
+                    fusion._synchronize_allreduce_quant_capability(
+                        use_attn_tp_group
+                    )
+
+                    self.assertEqual(
+                        fusion._flashinfer_allreduce_quant_capability_by_group,
+                        {cpu_group: expected_available},
+                    )
+                    all_reduce.assert_called_once()
+
+                    all_reduce.reset_mock()
+                    self.assertEqual(
+                        fusion._is_allreduce_quant_capability_available_for_group(
+                            use_attn_tp_group
+                        ),
+                        expected_available,
+                    )
+                    all_reduce.assert_not_called()
+
+    def test_pre_initialize_syncs_both_capabilities_before_early_return(self):
+        for comm, unavailable in ((None, False), (_FakeFlashInferComm(), True)):
+            synchronize = MagicMock()
+            with (
+                self.subTest(comm=comm, unavailable=unavailable),
+                patch.object(fusion, "_flashinfer_comm", comm),
+                patch.object(
+                    fusion, "_flashinfer_allreduce_unavailable", unavailable
+                ),
+                patch.object(
+                    fusion,
+                    "_synchronize_allreduce_quant_capability",
+                    synchronize,
+                    create=True,
+                ),
+                patch.object(fusion, "ensure_workspace_initialized") as initialize,
+            ):
+                fusion.pre_initialize_workspaces(
+                    max_token_num=8,
+                    hidden_dim=16,
+                    dtype=torch.bfloat16,
+                )
+
+            self.assertEqual(synchronize.call_args_list, [call(False), call(True)])
+            initialize.assert_not_called()
 
 
 def _torch_allreduce_residual_rmsnorm_baseline(
