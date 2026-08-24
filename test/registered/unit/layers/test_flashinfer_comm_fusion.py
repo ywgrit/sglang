@@ -1,5 +1,7 @@
 import contextlib
+import importlib.util
 import inspect
+from pathlib import Path
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -14,6 +16,76 @@ from sglang.test.test_utils import CustomTestCase
 # Collectives are mocked and world_size is a plain int, so the world_size=4
 # cases need one real CUDA device.
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+
+
+def _load_flashinfer_fp8_benchmark_module():
+    benchmark_path = (
+        Path(__file__).resolve().parents[4]
+        / "benchmark/kernels/bench_flashinfer_allreduce_rmsnorm_fp8_quant.py"
+    )
+    if not benchmark_path.is_file():
+        raise AssertionError(f"Benchmark module is missing: {benchmark_path}")
+    spec = importlib.util.spec_from_file_location(
+        "bench_flashinfer_allreduce_rmsnorm_fp8_quant", benchmark_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load benchmark module at {benchmark_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestFlashInferAllReduceFp8BenchmarkContract(unittest.TestCase):
+    def test_default_shapes_and_case_names_are_stable(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+
+        self.assertEqual(benchmark.DEFAULT_TOKEN_COUNTS, (1, 8, 32, 128, 512))
+        self.assertEqual(
+            benchmark.CASE_NAMES,
+            (
+                "split_ar_rmsnorm_static_fp8",
+                "flashinfer_ar_rmsnorm_then_static_fp8",
+                "flashinfer_ar_rmsnorm_static_fp8",
+                "flashinfer_ar_rmsnorm_static_fp8_bf16",
+            ),
+        )
+
+    def test_percentile_summary_uses_linear_interpolation(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+
+        self.assertEqual(
+            benchmark.percentile_summary([10.0, 20.0, 30.0, 40.0, 50.0]),
+            {"p10_us": 14.0, "p50_us": 30.0, "p90_us": 46.0},
+        )
+
+    def test_metadata_and_result_schemas_cover_reproducibility(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+
+        self.assertTrue(
+            {
+                "warmup",
+                "iterations",
+                "repeats",
+                "hidden_size",
+                "dtype",
+                "backend",
+                "gpu",
+                "torch_version",
+                "cuda_version",
+                "flashinfer_version",
+                "flashinfer_path",
+                "sglang_commit",
+            }.issubset(benchmark.METADATA_FIELDS)
+        )
+        self.assertTrue(
+            {
+                "mode",
+                "world_size",
+                "token_count",
+                "case",
+                "correctness",
+            }.issubset(benchmark.RESULT_FIELDS)
+        )
 
 
 class _FakeWorkspace:
