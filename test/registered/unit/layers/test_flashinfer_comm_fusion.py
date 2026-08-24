@@ -188,6 +188,101 @@ class TestFlashInferAllReduceFp8BenchmarkContract(unittest.TestCase):
             benchmark.cleanup_runtime(runtime, model_parallel_started=True)
         self.assertEqual(events, ["workspace", "model", "dist"])
 
+    def test_cuda_device_is_bound_before_runtime_import(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+
+        main_source = inspect.getsource(benchmark.main)
+        self.assertLess(
+            main_source.index("torch.cuda.set_device(local_rank)"),
+            main_source.index("runtime = _load_runtime()"),
+        )
+
+    def test_split_case_uses_production_gemma_rmsnorm_forward(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+
+        runtime_source = inspect.getsource(benchmark._load_runtime)
+        case_source = inspect.getsource(benchmark._make_case_state)
+        self.assertIn("GemmaRMSNorm", runtime_source)
+        self.assertIn("gemma_norm.forward_cuda", case_source)
+        self.assertGreaterEqual(case_source.count("weight=gemma_weight"), 2)
+        self.assertNotIn("torch_functional.rms_norm", case_source)
+
+    def test_gemma_raw_weight_builds_stable_adjusted_buffer(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+        self.assertTrue(
+            hasattr(benchmark, "_build_gemma_norm"),
+            "benchmark must build Gemma raw/adjusted weights outside cases",
+        )
+        raw_weight = torch.tensor([-0.25, 0.5], dtype=torch.float32)
+
+        class FakeGemmaRMSNorm:
+            def __init__(self, hidden_size, eps):
+                self.weight = torch.zeros(hidden_size)
+                self.gemma_weight = torch.ones(hidden_size)
+
+            def to(self, *, device, dtype):
+                self.weight = self.weight.to(device=device, dtype=dtype)
+                self.gemma_weight = self.gemma_weight.to(device=device, dtype=dtype)
+                return self
+
+            def _weight_loader(self, parameter, loaded_weight):
+                parameter.copy_(loaded_weight)
+                torch.add(parameter, 1.0, out=self.gemma_weight)
+
+        runtime = types.SimpleNamespace(GemmaRMSNorm=FakeGemmaRMSNorm)
+        norm, adjusted = benchmark._build_gemma_norm(
+            runtime,
+            hidden_size=2,
+            eps=1e-6,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            raw_weight=raw_weight,
+        )
+
+        adjusted_pointer = norm.gemma_weight.data_ptr()
+        torch.testing.assert_close(norm.weight, raw_weight)
+        torch.testing.assert_close(adjusted, raw_weight + 1.0)
+        self.assertIs(adjusted, norm.gemma_weight)
+        self.assertEqual(adjusted.data_ptr(), adjusted_pointer)
+
+    def test_correctness_rejects_zero_quant_against_nonzero_baseline(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+        runtime = types.SimpleNamespace(torch=torch)
+        scale = torch.tensor(1e-4, dtype=torch.float32)
+        residual = torch.zeros((1, 2), dtype=torch.float32)
+        empty_norm = torch.empty((0,), dtype=torch.float32)
+        baseline_quant = torch.tensor(
+            [[10.0, -10.0]], dtype=torch.float8_e4m3fn
+        )
+        actual_quant = torch.zeros_like(baseline_quant)
+        baseline = (baseline_quant, residual, empty_norm)
+        actual = (actual_quant, residual.clone(), empty_norm.clone())
+
+        with self.assertRaises(AssertionError):
+            benchmark._assert_case_matches_baseline(
+                runtime,
+                actual,
+                baseline,
+                torch.float32,
+                scale,
+                benchmark.CASE_NAMES[2],
+            )
+
+    def test_launch_rejects_scale_above_representative_range(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+        fake_torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(
+                is_available=lambda: True,
+                device_count=lambda: 2,
+            )
+        )
+        args = types.SimpleNamespace(scale=0.5, eps=1e-6)
+
+        launch_source = inspect.getsource(benchmark._validate_launch)
+        self.assertNotIn("runtime.torch", launch_source)
+        with self.assertRaisesRegex(ValueError, "1e-4.*0.1"):
+            benchmark._validate_launch(fake_torch, args, 2, 0)
+
 
 class _FakeWorkspace:
     def __init__(self, backend, world_size, dtype=torch.bfloat16):

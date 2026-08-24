@@ -190,7 +190,12 @@ def build_parser():
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--eps", type=float, default=1e-6)
-    parser.add_argument("--scale", type=float, default=0.02)
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=0.02,
+        help="static FP8 activation scale in the representative range [1e-4, 0.1]",
+    )
     parser.add_argument(
         "--json-out",
         default="flashinfer_allreduce_rmsnorm_fp8_quant.json",
@@ -211,7 +216,6 @@ def _load_runtime():
     import flashinfer
     import torch
     import torch.distributed as dist
-    import torch.nn.functional as torch_functional
 
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
     from sglang.srt.distributed.communication_op import (
@@ -232,6 +236,7 @@ def _load_runtime():
         resolve_flashinfer_allreduce_fusion_backend,
         try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant,
     )
+    from sglang.srt.layers.layernorm import GemmaRMSNorm
     from sglang.srt.runtime_context import get_context, get_server_args
 
     return SimpleNamespace(**locals())
@@ -285,7 +290,7 @@ def _make_inputs(runtime, token_count, hidden_size, dtype, seed, rank, device):
         dtype=runtime.torch.float32,
         generator=input_generator,
     ).to(dtype)
-    weight = (
+    raw_weight = (
         runtime.torch.randn(
             hidden_size,
             device=device,
@@ -293,25 +298,43 @@ def _make_inputs(runtime, token_count, hidden_size, dtype, seed, rank, device):
             generator=weight_generator,
         )
         * 0.1
-        + 1.0
     ).to(dtype)
-    return input_tensor.contiguous(), residual.contiguous(), weight.contiguous()
+    return (
+        input_tensor.contiguous(),
+        residual.contiguous(),
+        raw_weight.contiguous(),
+    )
+
+
+def _build_gemma_norm(runtime, hidden_size, eps, dtype, device, raw_weight):
+    """Load checkpoint-style raw weight and retain the adjusted graph buffer."""
+    gemma_norm = runtime.GemmaRMSNorm(hidden_size, eps=eps).to(
+        device=device, dtype=dtype
+    )
+    adjusted_pointer = gemma_norm.gemma_weight.data_ptr()
+    gemma_norm._weight_loader(gemma_norm.weight, raw_weight)
+    if gemma_norm.gemma_weight.data_ptr() != adjusted_pointer:
+        raise RuntimeError("Gemma adjusted weight storage changed during loading")
+    return gemma_norm, gemma_norm.gemma_weight
 
 
 def _make_case_state(
-    runtime, case_name, base_input, base_residual, weight, scale, args
+    runtime,
+    case_name,
+    base_input,
+    base_residual,
+    gemma_norm,
+    gemma_weight,
+    scale,
+    args,
 ):
     input_tensor = base_input.clone()
     residual = base_residual.clone()
 
     def split_ar_rmsnorm_static_fp8():
         allreduced = runtime.tensor_model_parallel_all_reduce(input_tensor)
-        residual_out = allreduced + residual
-        norm_out = runtime.torch_functional.rms_norm(
-            residual_out,
-            (args.hidden_size,),
-            weight,
-            args.eps,
+        norm_out, residual_out = gemma_norm.forward_cuda(
+            allreduced, residual
         )
         quant_out, _ = runtime.static_quant_fp8(
             norm_out.contiguous(), scale, repeat_scale=False
@@ -322,7 +345,7 @@ def _make_case_state(
         norm_out, residual_out = runtime.flashinfer_allreduce_residual_rmsnorm(
             input_tensor=input_tensor,
             residual=residual,
-            weight=weight,
+            weight=gemma_weight,
             eps=args.eps,
             max_token_num=max(args.tokens),
             use_attn_tp_group=True,
@@ -339,7 +362,7 @@ def _make_case_state(
             runtime.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
                 input_tensor=input_tensor,
                 residual=residual,
-                weight=weight,
+                weight=gemma_weight,
                 scale_factor=scale,
                 eps=args.eps,
                 max_token_num=max(args.tokens),
@@ -361,7 +384,8 @@ def _make_case_state(
         name=case_name,
         input=input_tensor,
         residual=residual,
-        weight=weight,
+        weight=gemma_weight,
+        gemma_norm=gemma_norm,
         scale=scale,
         call=calls[case_name],
         graph=None,
@@ -384,7 +408,7 @@ def _tolerances(dtype, scale):
     else:
         residual = {"rtol": 5e-3, "atol": 5e-3}
         norm = {"rtol": 1e-2, "atol": 1e-2}
-    dequant = {"rtol": 0.08, "atol": max(2.0 * scale, 0.04)}
+    dequant = {"rtol": 0.0, "atol": min(2.0 * scale, 0.2)}
     return residual, norm, dequant
 
 
@@ -585,7 +609,7 @@ def _base_result(mode, world_size, token_count, case_name, outcome):
 
 
 def _run_shape(runtime, args, mode, token_count, dtype, rank, world_size, device):
-    base_input, base_residual, weight = _make_inputs(
+    base_input, base_residual, raw_weight = _make_inputs(
         runtime,
         token_count,
         args.hidden_size,
@@ -593,6 +617,14 @@ def _run_shape(runtime, args, mode, token_count, dtype, rank, world_size, device
         args.seed,
         rank,
         device,
+    )
+    gemma_norm, gemma_weight = _build_gemma_norm(
+        runtime,
+        hidden_size=args.hidden_size,
+        eps=args.eps,
+        dtype=dtype,
+        device=device,
+        raw_weight=raw_weight,
     )
     scale = runtime.torch.tensor(
         args.scale, dtype=runtime.torch.float32, device=device
@@ -603,7 +635,8 @@ def _run_shape(runtime, args, mode, token_count, dtype, rank, world_size, device
             case_name,
             base_input,
             base_residual,
-            weight,
+            gemma_norm,
+            gemma_weight,
             scale,
             args,
         )
@@ -622,7 +655,8 @@ def _run_shape(runtime, args, mode, token_count, dtype, rank, world_size, device
                 CASE_NAMES[0],
                 base_input,
                 base_residual,
-                weight,
+                gemma_norm,
+                gemma_weight,
                 scale,
                 args,
             )
@@ -794,23 +828,26 @@ def _print_results(metadata, results):
             print(f"        error: {row['error']}")
 
 
-def _validate_launch(runtime, args, world_size, local_rank):
+def _validate_launch(torch, args, world_size, local_rank):
     if world_size != 2:
         raise RuntimeError(
             "This benchmark requires exactly one local TP=2 torchrun job "
             f"(WORLD_SIZE=2); got WORLD_SIZE={world_size}."
         )
-    if not runtime.torch.cuda.is_available():
+    if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if runtime.torch.cuda.device_count() < 2:
+    if torch.cuda.device_count() < 2:
         raise RuntimeError(
             "Two visible local CUDA devices are required; "
-            f"found {runtime.torch.cuda.device_count()}."
+            f"found {torch.cuda.device_count()}."
         )
     if local_rank not in (0, 1):
         raise RuntimeError(f"LOCAL_RANK must be 0 or 1; got {local_rank}")
-    if args.scale <= 0 or not math.isfinite(args.scale):
-        raise ValueError("--scale must be finite and positive")
+    if not math.isfinite(args.scale) or not 1e-4 <= args.scale <= 0.1:
+        raise ValueError(
+            "--scale must be within 1e-4 and 0.1 to keep representative "
+            "activation quantization error bounded without trivial saturation"
+        )
     if args.eps <= 0 or not math.isfinite(args.eps):
         raise ValueError("--eps must be finite and positive")
 
@@ -831,10 +868,12 @@ def cleanup_runtime(runtime, model_parallel_started):
 def main(argv=None):
     args = build_parser().parse_args(argv)
     rank, world_size, local_rank = validate_torchrun_environment(os.environ)
+    import torch
+
+    _validate_launch(torch, args, world_size, local_rank)
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
     runtime = _load_runtime()
-    _validate_launch(runtime, args, world_size, local_rank)
-    runtime.torch.cuda.set_device(local_rank)
-    device = runtime.torch.device("cuda", local_rank)
     dtype = _dtype_from_name(runtime.torch, args.dtype)
     repo_root = Path(__file__).resolve().parents[2]
 
