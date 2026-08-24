@@ -117,6 +117,21 @@ class TestFlashInferAllReduceFp8BenchmarkContract(unittest.TestCase):
         self.assertEqual(parsed, metadata)
         self.assertIn("mode   tokens case", rendered[table_offset:])
 
+    def test_fabric_metadata_uses_supported_nvidia_smi_query(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+
+        self.assertEqual(
+            benchmark.GPU_FABRIC_QUERY,
+            (
+                "nvidia-smi",
+                "--query-gpu=index,uuid,fabric.state,fabric.status",
+                "--format=csv,noheader",
+            ),
+        )
+        source = inspect.getsource(benchmark._metadata)
+        self.assertIn("_run_readonly(GPU_FABRIC_QUERY)", source)
+        self.assertNotIn('"-d", "FABRIC"', source)
+
     def test_torchrun_environment_requires_local_world_size_two(self):
         benchmark = _load_flashinfer_fp8_benchmark_module()
         valid = {
