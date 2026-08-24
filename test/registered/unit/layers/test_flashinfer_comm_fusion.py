@@ -745,6 +745,8 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
         capability_available=True,
         workspace_available=True,
         manager_overrides=None,
+        expected_backend="trtllm",
+        workspace_backend="trtllm",
     ):
         cpu_group = object()
         coordinator = types.SimpleNamespace(
@@ -755,7 +757,9 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
         )
         manager_overrides = manager_overrides or {}
         manager_dtype = manager_overrides.get("dtype", torch.bfloat16)
-        workspace = _FakeWorkspace("trtllm", world_size, dtype=manager_dtype)
+        workspace = _FakeWorkspace(
+            workspace_backend, world_size, dtype=manager_dtype
+        )
         manager = fusion.FlashInferWorkspaceManager()
         manager.workspace = workspace
         manager.initialized = True
@@ -793,6 +797,11 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
                 capability_cache,
             ),
             patch.object(fusion, "is_flashinfer_available", return_value=True),
+            patch.object(
+                fusion,
+                "resolve_flashinfer_allreduce_fusion_backend",
+                return_value=expected_backend,
+            ),
             patch.object(fusion, "get_parallel", return_value=parallel),
             patch.object(fusion, "get_moe_tp_group", return_value=coordinator),
             patch.object(
@@ -1039,20 +1048,33 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
 
         input_tensor, residual, weight, scale = self._inputs()
         cases = (
-            ("not_initialized", {"initialized": False}),
-            ("missing_workspace", {"workspace": None}),
-            ("wrong_world_size", {"world_size": 2}),
-            ("wrong_rank", {"rank": 1}),
-            ("wrong_group", {"group": (object(), object())}),
-            ("wrong_dtype", {"dtype": torch.float16}),
+            ("not_initialized", {"initialized": False}, {}),
+            ("missing_workspace", {"workspace": None}, {}),
+            ("wrong_world_size", {"world_size": 2}, {}),
+            ("wrong_rank", {"rank": 1}, {}),
+            ("wrong_group", {"group": (object(), object())}, {}),
+            ("wrong_dtype", {"dtype": torch.float16}, {}),
+            ("wrong_manager_backend", {"backend": "mnnvl"}, {}),
+            (
+                "wrong_workspace_backend",
+                {"backend": "trtllm"},
+                {"workspace_backend": "mnnvl"},
+            ),
+            (
+                "wrong_resolved_backend",
+                {"backend": "mnnvl"},
+                {"workspace_backend": "mnnvl"},
+            ),
         )
-        for case_name, manager_overrides in cases:
+        for case_name, manager_overrides, path_overrides in cases:
             fake_comm = _FakeFlashInferComm()
             private_op = MagicMock(
                 side_effect=AssertionError("invalid manager reached custom op")
             )
             with self.subTest(case_name=case_name), self._patched_quant_path(
-                fake_comm, manager_overrides=manager_overrides
+                fake_comm,
+                manager_overrides=manager_overrides,
+                **path_overrides,
             ) as (_, _, ensure_workspace), patch.object(
                 fusion,
                 "_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op",
@@ -1129,22 +1151,43 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
 
         input_tensor, residual, weight, scale = self._inputs()
         cases = (
-            ("not_initialized", {"initialized": False}),
-            ("missing_workspace", {"workspace": None}),
-            ("world_size", {"world_size": 2}),
-            ("rank", {"rank": 1}),
-            ("group", {"group": (object(), object())}),
-            ("dtype", {"dtype": torch.float16}),
-            ("token_capacity", {"max_token_num": input_tensor.shape[0] - 1}),
-            ("hidden_capacity", {"hidden_dim": input_tensor.shape[-1] - 1}),
+            ("not_initialized", {"initialized": False}, {}),
+            ("missing_workspace", {"workspace": None}, {}),
+            ("world_size", {"world_size": 2}, {}),
+            ("rank", {"rank": 1}, {}),
+            ("group", {"group": (object(), object())}, {}),
+            ("dtype", {"dtype": torch.float16}, {}),
+            ("manager_backend", {"backend": "mnnvl"}, {}),
+            (
+                "workspace_backend",
+                {"backend": "trtllm"},
+                {"workspace_backend": "mnnvl"},
+            ),
+            (
+                "resolved_backend",
+                {"backend": "mnnvl"},
+                {"workspace_backend": "mnnvl"},
+            ),
+            (
+                "token_capacity",
+                {"max_token_num": input_tensor.shape[0] - 1},
+                {},
+            ),
+            (
+                "hidden_capacity",
+                {"hidden_dim": input_tensor.shape[-1] - 1},
+                {},
+            ),
         )
-        for case_name, manager_overrides in cases:
+        for case_name, manager_overrides, path_overrides in cases:
             fake_comm = _FakeFlashInferComm()
             private_op = MagicMock(
                 side_effect=AssertionError("invalid metadata reached kernel")
             )
             with self.subTest(case_name=case_name), self._patched_quant_path(
-                fake_comm, manager_overrides=manager_overrides
+                fake_comm,
+                manager_overrides=manager_overrides,
+                **path_overrides,
             ) as (_, manager, ensure_workspace):
                 manager.is_buffer_size_sufficient = MagicMock(
                     side_effect=AssertionError(
@@ -1256,6 +1299,43 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
                 private_op = MagicMock(return_value=expected)
                 with self._patched_quant_path(
                     fake_comm, manager_overrides={"dtype": dtype}
+                ) as (_, _, ensure_workspace), patch.object(
+                    fusion,
+                    "_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op",
+                    private_op,
+                ):
+                    result = fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+                        input_tensor=input_tensor,
+                        residual=residual,
+                        weight=weight,
+                        scale_factor=scale,
+                        use_attn_tp_group=False,
+                    )
+
+                self.assertIs(result, expected)
+                ensure_workspace.assert_called_once()
+                private_op.assert_called_once()
+                self.assertEqual(fake_comm.calls, [])
+
+    def test_static_fp8_quant_accepts_exact_resolved_backend(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for FlashInfer FP8 fusion contract")
+
+        input_tensor, residual, weight, scale = self._inputs()
+        for backend in ("trtllm", "mnnvl"):
+            with self.subTest(backend=backend):
+                fake_comm = _FakeFlashInferComm()
+                expected = (
+                    torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn),
+                    torch.empty_like(residual),
+                    input_tensor.new_empty((0,)),
+                )
+                private_op = MagicMock(return_value=expected)
+                with self._patched_quant_path(
+                    fake_comm,
+                    expected_backend=backend,
+                    workspace_backend=backend,
+                    manager_overrides={"backend": backend},
                 ) as (_, _, ensure_workspace), patch.object(
                     fusion,
                     "_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op",
