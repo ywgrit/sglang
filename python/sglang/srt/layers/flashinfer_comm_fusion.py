@@ -560,8 +560,6 @@ class FlashInferWorkspaceManager:
                 create_kw["group"] = device_group
             if use_oneshot is not None:
                 create_kw["force_oneshot_support"] = bool(use_oneshot)
-            if use_fp32_lamport:
-                create_kw["use_fp32_lamport"] = True
             self.workspace = _create_allreduce_fusion_workspace(**create_kw)
             self._configure_workspace_size_check()
             self.world_size = world_size
