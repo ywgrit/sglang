@@ -393,6 +393,10 @@ def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
 
 
 def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
+    input_scale = getattr(linear, "input_scale", None)
+    if input_scale is None:
+        return False
+
     try:
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
     except ImportError:
@@ -403,6 +407,14 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
             or getattr(quant_method, "use_mxfp8", False)
             or getattr(quant_method, "use_marlin", False)
         )
+    try:
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp8LinearMethod,
+        )
+    except ImportError:
+        ModelOptFp8LinearMethod = ()
+    if isinstance(quant_method, ModelOptFp8LinearMethod):
+        return not getattr(quant_method, "use_marlin", False)
     try:
         from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
             CompressedTensorsLinearMethod,

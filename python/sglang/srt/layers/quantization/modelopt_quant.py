@@ -609,6 +609,22 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
+        if isinstance(x, tuple):
+            if self.use_marlin:
+                raise TypeError(
+                    "ModelOpt FP8 Marlin cannot consume pre-quantized tuple input"
+                )
+            qx, x_scale = x[0], x[1]
+            out_dtype = x[2] if len(x) > 2 else None
+            return apply_fp8_linear(
+                input=qx,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=x_scale,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                pre_quant_output_dtype=out_dtype,
+            )
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
