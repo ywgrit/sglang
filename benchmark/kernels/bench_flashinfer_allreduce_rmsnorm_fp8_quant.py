@@ -45,6 +45,10 @@ METADATA_FIELDS = (
     "gpu_count",
     "gpu_names",
     "gpu_topology",
+    "nvidia_driver_version",
+    "nccl_version",
+    "nvlink_status",
+    "gpu_fabric",
     "torch_version",
     "torch_git_version",
     "cuda_version",
@@ -820,6 +824,16 @@ def _package_commit(package_path):
     return _run_readonly(("git", "rev-parse", "HEAD"), cwd=start)
 
 
+def _nccl_version(torch):
+    try:
+        version = torch.cuda.nccl.version()
+    except (AttributeError, RuntimeError):
+        return None
+    if isinstance(version, (tuple, list)):
+        return ".".join(str(component) for component in version)
+    return str(version)
+
+
 def _metadata(runtime, args, resolved_backend, world_size, device, repo_root):
     flashinfer_path = str(Path(runtime.flashinfer.__file__).resolve())
     try:
@@ -838,6 +852,12 @@ def _metadata(runtime, args, resolved_backend, world_size, device, repo_root):
         "gpu_count": runtime.torch.cuda.device_count(),
         "gpu_names": gpu_names,
         "gpu_topology": _run_readonly(("nvidia-smi", "topo", "-m")),
+        "nvidia_driver_version": _run_readonly(
+            ("nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader")
+        ),
+        "nccl_version": _nccl_version(runtime.torch),
+        "nvlink_status": _run_readonly(("nvidia-smi", "nvlink", "--status")),
+        "gpu_fabric": _run_readonly(("nvidia-smi", "-q", "-d", "FABRIC")),
         "torch_version": runtime.torch.__version__,
         "torch_git_version": getattr(runtime.torch.version, "git_version", None),
         "cuda_version": runtime.torch.version.cuda,
