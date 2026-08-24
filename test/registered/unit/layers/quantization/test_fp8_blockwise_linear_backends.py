@@ -144,7 +144,7 @@ class TestModeloptFp8PrequantizedDispatch(CustomTestCase):
         method = self._make_method()
         qinput = torch.empty((2, 16), dtype=torch.float8_e4m3fn)
         input_scale = torch.tensor(0.125)
-        bias = torch.randn(8, dtype=torch.bfloat16)
+        bias = torch.randn(8, dtype=torch.float16)
         layer = types.SimpleNamespace(
             weight=torch.empty((16, 8), dtype=torch.float8_e4m3fn),
             weight_scale=torch.tensor(0.25),
@@ -152,7 +152,7 @@ class TestModeloptFp8PrequantizedDispatch(CustomTestCase):
             use_flashinfer_bmm=True,
             sm120_gemv_alpha=torch.ones(1),
         )
-        expected = torch.empty((2, 8), dtype=torch.bfloat16)
+        expected = torch.empty((2, 8), dtype=torch.float16)
 
         with (
             mock.patch.object(
@@ -163,7 +163,7 @@ class TestModeloptFp8PrequantizedDispatch(CustomTestCase):
             ) as flashinfer_bmm,
         ):
             actual = method.apply(
-                layer, (qinput, input_scale, torch.bfloat16), bias=bias
+                layer, (qinput, input_scale, torch.float16), bias=bias
             )
 
         self.assertIs(actual, expected)
@@ -174,7 +174,7 @@ class TestModeloptFp8PrequantizedDispatch(CustomTestCase):
             input_scale=input_scale,
             bias=bias,
             cutlass_fp8_supported=True,
-            pre_quant_output_dtype=torch.bfloat16,
+            pre_quant_output_dtype=torch.float16,
         )
         flashinfer_bmm.assert_not_called()
 
