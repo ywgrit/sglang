@@ -134,52 +134,12 @@ _ENV_MATRIX = (({}, {"SGLANG_IS_IN_CI": "true"}),)
 # are step-12 exposure like any other pair.
 _PASSED = frozenset({"model_path", "device", "random_seed"})
 
-# What is left reads the record because the record is the only thing that exists
-# at that point in the process. Everything else moved to the bags or to
-# `resolving_view`; a new entry here needs the same kind of reason.
-#
-#   engine.py / enable_symm_mem
-#       `_set_envs_and_config` sets NCCL environment variables before anything
-#       publishes -- there is no bag to read yet.
-#   engine.py / reasoning_parser, tool_call_parser
-#   template_detection.py / model_path
-#       the auto-parser detection is late resolution: it runs in the launcher's
-#       validation stage, decides these fields and writes them *in place*,
-#       before the publish that would give it a bag.
-_EXPOSED = {
-    ("configs/embedding_model_spec.py", "chunked_prefill_size"),
-    ("configs/embedding_model_spec.py", "cuda_graph_config"),
-    ("configs/embedding_model_spec.py", "disable_radix_cache"),
-    ("configs/embedding_model_spec.py", "is_embedding"),
-    ("configs/embedding_model_spec.py", "prefill_only_disable_kv_cache"),
-    ("entrypoints/engine.py", "enable_symm_mem"),
-    ("entrypoints/engine.py", "reasoning_parser"),
-    ("entrypoints/engine.py", "tool_call_parser"),
-    ("layers/flashinfer_comm_fusion.py", "flashinfer_allreduce_fusion_backend"),
-    ("layers/moe/utils.py", "deepep_mode"),
-    ("layers/moe/utils.py", "moe_a2a_backend"),
-    ("layers/moe/utils.py", "moe_runner_backend"),
-    ("layers/moe/utils.py", "quantization"),
-    ("layers/moe/utils.py", "speculative_moe_runner_backend"),
-    ("speculative/draft_worker_common.py", "speculative_draft_attention_backend"),
-    ("utils/common.py", "speculative_num_draft_tokens"),
-    ("utils/common.py", "speculative_num_steps"),
-    ("utils/hf_transformers/processor.py", "image_processor_backend"),
-    ("weight_cache/daemon.py", "attn_cp_size"),
-    ("weight_cache/daemon.py", "deepep_mode"),
-    ("weight_cache/daemon.py", "dp_size"),
-    ("weight_cache/daemon.py", "dtype"),
-    ("weight_cache/daemon.py", "enable_dp_attention"),
-    ("weight_cache/daemon.py", "enable_dp_lm_head"),
-    ("weight_cache/daemon.py", "ep_size"),
-    ("weight_cache/daemon.py", "load_format"),
-    ("weight_cache/daemon.py", "model_path"),
-    ("weight_cache/daemon.py", "moe_a2a_backend"),
-    ("weight_cache/daemon.py", "moe_dense_tp_size"),
-    ("weight_cache/daemon.py", "moe_dp_size"),
-    ("weight_cache/daemon.py", "pp_size"),
-    ("weight_cache/daemon.py", "quantization"),
-}
+# Empty. A pair belongs here when a reader has no bag to read -- it runs before
+# its process publishes -- and cannot use `resolving_view` either. The launcher's
+# pre-publish reads (`_set_envs_and_config`, the auto-parser gate) and the
+# late-resolution detection it calls all read the declarations now, so nothing
+# qualifies. A new entry needs that kind of reason next to it.
+_EXPOSED: frozenset = frozenset()
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
 # `is_cuda()` gated): asserted on the CUDA registration, invisible to the CPU
@@ -192,24 +152,7 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # Axis two: (file, field) pairs where a supplied-instance read names a field that
 # some code overrides post-publish. Each needs an ordering judgment, not a blanket
 # conversion; the list exists so a new one is a decision made when it is written.
-_OVERRIDDEN_AND_READ = {
-    ("entrypoints/engine.py", "reasoning_parser"),
-    ("entrypoints/engine.py", "tool_call_parser"),
-    ("mem_cache/kv_cache_builder.py", "hicache_storage_backend"),
-    ("mem_cache/pool_host/common.py", "hicache_storage_backend"),
-    ("mem_cache/pool_host/common.py", "hicache_storage_backend_extra_config"),
-    ("mem_cache/unified_radix_cache.py", "hicache_storage_backend"),
-    ("mem_cache/unified_radix_cache.py", "hicache_storage_backend_extra_config"),
-    ("mem_cache/unified_radix_cache.py", "hicache_storage_prefetch_policy"),
-    ("mem_cache/unified_radix_cache.py", "hicache_write_policy"),
-    ("utils/common.py", "speculative_num_draft_tokens"),
-    ("utils/common.py", "speculative_num_steps"),
-    ("weight_cache/daemon.py", "dp_size"),
-    ("weight_cache/daemon.py", "dtype"),
-    ("weight_cache/daemon.py", "ep_size"),
-    ("weight_cache/daemon.py", "load_format"),
-    ("weight_cache/daemon.py", "model_path"),
-}
+_OVERRIDDEN_AND_READ: frozenset = frozenset()
 
 
 def _expanded_override_keys(rel, tree, call, kw) -> set:

@@ -79,6 +79,7 @@ _KNOWN_ENTRIES = frozenset(
         ),
         ("srt/ray/scheduler_actor.py", "__init__"),
         ("srt/disaggregation/encoder/http_server.py", "launch_server"),
+        ("srt/entrypoints/grpc_server.py", "serve_grpc"),
         ("srt/entrypoints/engine.py", "_launch_subprocesses"),
         (
             "srt/elastic_ep/expert_backup_manager.py",
