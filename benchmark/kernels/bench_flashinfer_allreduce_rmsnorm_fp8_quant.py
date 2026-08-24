@@ -423,19 +423,25 @@ def _finite_e4m3_values(torch, device):
     return torch.unique(values[torch.isfinite(values)], sorted=True)
 
 
-def _fp8_ulp_dequant_allowance(torch, baseline_quant, scale, max_ulps=MAX_FP8_ULPS):
-    baseline_values = baseline_quant.float()
-    lattice = _finite_e4m3_values(torch, baseline_quant.device)
-    lower_indices = torch.searchsorted(
-        lattice, baseline_values, right=False
-    ).sub_(1).clamp_(min=0)
-    upper_indices = torch.searchsorted(
-        lattice, baseline_values, right=True
-    ).clamp_(max=lattice.numel() - 1)
-    lower_steps = baseline_values - lattice[lower_indices]
-    upper_steps = lattice[upper_indices] - baseline_values
-    local_ulp = torch.maximum(lower_steps, upper_steps)
-    return local_ulp * max_ulps * scale
+def _fp8_lattice_indices(torch, values, lattice, label):
+    float_values = values.float()
+    if not bool(torch.isfinite(float_values).all()):
+        raise AssertionError(f"{label} contains non-finite FP8 values")
+    indices = torch.searchsorted(lattice, float_values)
+    in_range = indices < lattice.numel()
+    safe_indices = indices.clamp(max=lattice.numel() - 1)
+    exact = in_range & lattice[safe_indices].eq(float_values)
+    if not bool(exact.all()):
+        raise AssertionError(f"{label} contains values outside the E4M3 lattice")
+    return safe_indices
+
+
+def _unravel_flat_index(flat_index, shape):
+    position = []
+    for size in reversed(shape):
+        position.append(flat_index % size)
+        flat_index //= size
+    return tuple(reversed(position))
 
 
 def _local_fp8_saturation_error(
@@ -469,6 +475,16 @@ def _assert_case_matches_baseline(runtime, actual, baseline, dtype, scale, case_
     actual_quant, actual_residual, actual_norm = actual
     baseline_quant, baseline_residual, baseline_norm = baseline
     residual_tol, norm_tol = _tolerances(dtype)
+    if actual_quant.shape != baseline_quant.shape:
+        raise AssertionError(
+            f"{case_name} quant shape mismatch: {actual_quant.shape} != "
+            f"{baseline_quant.shape}"
+        )
+    if actual_quant.device != baseline_quant.device:
+        raise AssertionError(
+            f"{case_name} quant device mismatch: {actual_quant.device} != "
+            f"{baseline_quant.device}"
+        )
     if actual_quant.dtype != baseline_quant.dtype:
         raise AssertionError(
             f"{case_name} quant dtype mismatch: {actual_quant.dtype} != "
@@ -480,21 +496,23 @@ def _assert_case_matches_baseline(runtime, actual, baseline, dtype, scale, case_
         msg=lambda message: f"{case_name} residual mismatch: {message}",
         **residual_tol,
     )
-    dequant_difference = (
-        actual_quant.float() - baseline_quant.float()
-    ).abs() * scale
-    allowed_difference = _fp8_ulp_dequant_allowance(
-        runtime.torch, baseline_quant, scale
+    lattice = _finite_e4m3_values(runtime.torch, baseline_quant.device)
+    actual_indices = _fp8_lattice_indices(
+        runtime.torch, actual_quant, lattice, f"{case_name} actual quant"
     )
-    violations = dequant_difference > allowed_difference
+    baseline_indices = _fp8_lattice_indices(
+        runtime.torch, baseline_quant, lattice, "baseline quant"
+    )
+    bucket_distance = (actual_indices - baseline_indices).abs()
+    violations = bucket_distance > MAX_FP8_ULPS
     if bool(violations.any()):
-        excess = dequant_difference - allowed_difference
-        violation_index = excess.reshape(-1).argmax()
-        max_difference = dequant_difference.reshape(-1)[violation_index].item()
-        allowed_at_max = allowed_difference.reshape(-1)[violation_index].item()
+        flat_distance = bucket_distance.reshape(-1)
+        flat_position = flat_distance.argmax().item()
+        max_bucket_distance = flat_distance[flat_position].item()
+        position = _unravel_flat_index(flat_position, actual_quant.shape)
         raise AssertionError(
-            f"{case_name} dequantized FP8 exceeds {MAX_FP8_ULPS} local ULPs: "
-            f"max_diff={max_difference:.8g}, allowed={allowed_at_max:.8g}"
+            f"{case_name} FP8 bucket distance exceeds {MAX_FP8_ULPS}: "
+            f"max_bucket_distance={max_bucket_distance}, position={position}"
         )
     if case_name in (CASE_NAMES[1], CASE_NAMES[3]):
         runtime.torch.testing.assert_close(

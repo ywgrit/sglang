@@ -297,6 +297,76 @@ class TestFlashInferAllReduceFp8BenchmarkContract(unittest.TestCase):
             benchmark.CASE_NAMES[2],
         )
 
+    def test_correctness_uses_strict_bucket_distance_across_exponent_boundary(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+        lattice = benchmark._finite_e4m3_values(torch, torch.device("cpu"))
+        baseline_index = torch.searchsorted(lattice, torch.tensor(1.875)).item()
+        baseline_quant = lattice[baseline_index].to(
+            torch.float8_e4m3fn
+        ).reshape(1, 1)
+        two_bucket_quant = lattice[baseline_index + 2].to(
+            torch.float8_e4m3fn
+        ).reshape(1, 1)
+        three_bucket_quant = lattice[baseline_index + 3].to(
+            torch.float8_e4m3fn
+        ).reshape(1, 1)
+        residual = torch.zeros((1, 1), dtype=torch.float32)
+        empty_norm = torch.empty((0,), dtype=torch.float32)
+        runtime = types.SimpleNamespace(torch=torch)
+        baseline = (baseline_quant, residual, empty_norm)
+
+        benchmark._assert_case_matches_baseline(
+            runtime,
+            (two_bucket_quant, residual.clone(), empty_norm.clone()),
+            baseline,
+            torch.float32,
+            torch.tensor(0.02),
+            benchmark.CASE_NAMES[2],
+        )
+        with self.assertRaisesRegex(AssertionError, "bucket"):
+            benchmark._assert_case_matches_baseline(
+                runtime,
+                (three_bucket_quant, residual.clone(), empty_norm.clone()),
+                baseline,
+                torch.float32,
+                torch.tensor(0.02),
+                benchmark.CASE_NAMES[2],
+            )
+
+    def test_correctness_rejects_nan_and_broadcastable_quant_shape(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+        runtime = types.SimpleNamespace(torch=torch)
+        baseline_quant = torch.tensor(
+            [[1.0, 1.0]], dtype=torch.float8_e4m3fn
+        )
+        residual = torch.zeros((1, 2), dtype=torch.float32)
+        empty_norm = torch.empty((0,), dtype=torch.float32)
+        baseline = (baseline_quant, residual, empty_norm)
+
+        invalid_quant_outputs = (
+            torch.tensor([[float("nan"), 1.0]]).to(torch.float8_e4m3fn),
+            torch.tensor([[1.0]], dtype=torch.float8_e4m3fn),
+        )
+        for actual_quant in invalid_quant_outputs:
+            with self.subTest(shape=actual_quant.shape), self.assertRaises(
+                AssertionError
+            ):
+                benchmark._assert_case_matches_baseline(
+                    runtime,
+                    (actual_quant, residual.clone(), empty_norm.clone()),
+                    baseline,
+                    torch.float32,
+                    torch.tensor(0.02),
+                    benchmark.CASE_NAMES[2],
+                )
+
+    def test_correctness_caller_only_catches_assertion_errors(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+
+        source = inspect.getsource(benchmark._check_eager_correctness)
+        self.assertIn("except AssertionError", source)
+        self.assertNotIn("except RuntimeError", source)
+
     def test_highly_saturated_baseline_quantization_is_rejected(self):
         benchmark = _load_flashinfer_fp8_benchmark_module()
         self.assertTrue(
