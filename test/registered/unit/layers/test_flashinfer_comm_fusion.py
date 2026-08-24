@@ -155,6 +155,39 @@ class TestFlashInferAllReduceFp8BenchmarkContract(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "local ranks"):
             benchmark.validate_rank_placement([("host-a", 0), ("host-a", 0)])
 
+    def test_model_parallel_lifecycle_starts_before_initialization(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+
+        main_source = inspect.getsource(benchmark.main)
+        self.assertIn("model_parallel_started = True", main_source)
+        self.assertLess(
+            main_source.index("model_parallel_started = True"),
+            main_source.index("runtime.initialize_model_parallel("),
+        )
+
+    def test_partial_model_parallel_cleanup_preserves_order_on_workspace_error(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+        self.assertTrue(
+            hasattr(benchmark, "cleanup_runtime"),
+            "benchmark must expose mockable lifecycle cleanup",
+        )
+        events = []
+
+        def fail_workspace_cleanup():
+            events.append("workspace")
+            raise RuntimeError("workspace cleanup failed")
+
+        runtime = types.SimpleNamespace(
+            cleanup_flashinfer_workspace=fail_workspace_cleanup,
+            destroy_model_parallel=lambda: events.append("model"),
+            destroy_distributed_environment=lambda: events.append("dist"),
+            dist=types.SimpleNamespace(is_initialized=lambda: True),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"):
+            benchmark.cleanup_runtime(runtime, model_parallel_started=True)
+        self.assertEqual(events, ["workspace", "model", "dist"])
+
 
 class _FakeWorkspace:
     def __init__(self, backend, world_size, dtype=torch.bfloat16):

@@ -815,6 +815,19 @@ def _validate_launch(runtime, args, world_size, local_rank):
         raise ValueError("--eps must be finite and positive")
 
 
+def cleanup_runtime(runtime, model_parallel_started):
+    """Tear down partial model-parallel state before distributed state."""
+    try:
+        if model_parallel_started:
+            try:
+                runtime.cleanup_flashinfer_workspace()
+            finally:
+                runtime.destroy_model_parallel()
+    finally:
+        if runtime.dist.is_initialized():
+            runtime.destroy_distributed_environment()
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     rank, world_size, local_rank = validate_torchrun_environment(os.environ)
@@ -825,7 +838,7 @@ def main(argv=None):
     dtype = _dtype_from_name(runtime.torch, args.dtype)
     repo_root = Path(__file__).resolve().parents[2]
 
-    model_parallel_initialized = False
+    model_parallel_started = False
     results = []
     metadata = None
     runtime.set_custom_all_reduce(True)
@@ -841,8 +854,8 @@ def main(argv=None):
                 distributed_init_method="env://",
                 backend="nccl",
             )
+            model_parallel_started = True
             runtime.initialize_model_parallel(tensor_model_parallel_size=world_size)
-            model_parallel_initialized = True
 
             placements = [None] * world_size
             runtime.dist.all_gather_object(
@@ -898,15 +911,7 @@ def main(argv=None):
                     "correctness; no successful timing was recorded for that path."
                 )
         finally:
-            try:
-                if model_parallel_initialized:
-                    try:
-                        runtime.cleanup_flashinfer_workspace()
-                    finally:
-                        runtime.destroy_model_parallel()
-            finally:
-                if runtime.dist.is_initialized():
-                    runtime.destroy_distributed_environment()
+            cleanup_runtime(runtime, model_parallel_started)
 
     return 0
 
