@@ -2166,6 +2166,71 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
                 )
             )
 
+    def test_fp32_workspace_init_matches_flashinfer_0617_signature(self):
+        """FP32 mode is derived from dtype in the pinned FlashInfer API."""
+        calls = []
+
+        def create_workspace_0617(
+            backend="auto",
+            world_size=None,
+            rank=None,
+            max_token_num=None,
+            hidden_dim=None,
+            dtype=None,
+            gpus_per_node=None,
+            comm_backend=None,
+            force_oneshot_support=False,
+            group=None,
+        ):
+            calls.append(
+                {
+                    "backend": backend,
+                    "world_size": world_size,
+                    "rank": rank,
+                    "max_token_num": max_token_num,
+                    "hidden_dim": hidden_dim,
+                    "dtype": dtype,
+                    "gpus_per_node": gpus_per_node,
+                    "comm_backend": comm_backend,
+                    "force_oneshot_support": force_oneshot_support,
+                    "group": group,
+                }
+            )
+            return _FakeWorkspace(backend, world_size, dtype=dtype)
+
+        manager = fusion.FlashInferWorkspaceManager()
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        try:
+            fusion._flashinfer_allreduce_unavailable = False
+            with (
+                patch.object(fusion, "_flashinfer_comm", object()),
+                patch.object(
+                    fusion,
+                    "_create_allreduce_fusion_workspace",
+                    create_workspace_0617,
+                ),
+                patch.object(
+                    fusion, "_preflight_check_workspace_memory", return_value=True
+                ),
+            ):
+                manager.initialize(
+                    world_size=4,
+                    rank=0,
+                    max_token_num=8,
+                    hidden_dim=4096,
+                    backend="trtllm",
+                    use_fp32_lamport=True,
+                    dtype=torch.float32,
+                )
+
+            self.assertTrue(manager.initialized)
+            self.assertFalse(fusion._flashinfer_allreduce_unavailable)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["dtype"], torch.float32)
+            self.assertTrue(manager.use_fp32_lamport)
+        finally:
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+
     def test_rejects_when_token_num_exceeds_workspace_capacity(self):
         """Oversized all-reduces fall back without triggering a warning.
 
