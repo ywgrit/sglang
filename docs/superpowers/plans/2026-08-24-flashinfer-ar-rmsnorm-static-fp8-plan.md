@@ -467,7 +467,6 @@ kwargs = dict(
     residual_out=residual_out,
     norm_out=norm_out if keep_bf16 else None,
     quant_out=quant_out,
-    scale_out=None,
     scale_factor=scale_factor,
     residual_in=residual,
     rms_gamma=weight,
@@ -521,7 +520,11 @@ actual, _ = layer((qinput, layer.input_scale, torch.bfloat16))
 
 Patch or instrument `static_quant_fp8` and assert it is not called from the linear method. Compare the output against the ordinary BF16-input path and require the same shape/dtype with the existing FP8 tolerance.
 
-Add a small mock-based CPU-discoverable unit if the real test cannot prove dispatch independently of hardware:
+Add a separate, undecorated
+`TestModeloptFp8PrequantizedDispatch(CustomTestCase)` for the mock-based
+CPU-discoverable unit. Do not put it inside
+`TestModeloptFp8PerTensorLinear`, because that class has an SM90+ `skipIf`
+decorator and would silently skip the contract on a no-GPU runner:
 
 ```python
 with patch.object(modelopt_quant, "apply_fp8_linear") as apply:
@@ -1145,7 +1148,14 @@ git commit -m "bench: measure FlashInfer allreduce FP8 fusion"
 
 **Step 1: Find a public Qwen3.5 static per-tensor FP8 checkpoint**
 
-Use primary model configuration/weight metadata. Confirm both `qkv_proj.input_scale` and GDN `in_proj_qkvz.input_scale` exist and are scalar. Do not infer this from the repository name alone.
+Use primary model configuration/weight metadata to identify candidates, then
+perform a real load-time inspection. The on-disk checkpoint may contain
+separate q/k/v or packed-partition scale entries rather than a literal
+`qkv_proj.input_scale` key. Completion requires that, after SGLang weight
+loading and `process_weights_after_loading`, the merged `qkv_proj.input_scale`
+and GDN `in_proj_qkvz.input_scale` both exist, are device tensors, and have
+`numel() == 1`. Do not infer this from the repository name or raw key names
+alone.
 
 **Step 2: Verify rental image prerequisites before asking the user to start it**
 
@@ -1159,7 +1169,14 @@ Required:
 
 **Step 3: Issue the explicit rental signal**
 
-Only after Tasks 1-12 pass locally, tell the user exactly: “现在租 2×H20（同一台机器，按量）”，plus estimated validation duration and shutdown criteria. Before that, keep saying no GPU is needed.
+Only after Tasks 1-12 pass locally and the exact checkpoint memory calculation
+is complete, tell the user exactly: “现在租 `{N}×{GPU型号}`（同一台机器，按量）”，
+plus estimated validation duration and shutdown criteria. `{N}` and the GPU
+type must come from measured/authoritative checkpoint weight size plus runtime,
+workspace, CUDA Graph, and KV-cache headroom. Do not hard-code 2×H20: the
+#31504 example Qwen3.5-397B-A17B-NVFP4-V2 may exceed 2×96GB after runtime
+overhead. A separate 2-GPU kernel benchmark does not prove the exact model fits
+two GPUs. Before this computed signal, keep saying no GPU is needed.
 
 ### Task 14: Run two-GPU correctness, graph, and performance validation
 
@@ -1227,9 +1244,15 @@ PYTHONPATH=python python -m pytest -q \
   test/registered/unit/models/test_qwen3_5_fused_ar_quant.py \
   test/registered/unit/models/test_qwen3_5_packed_weight_loader.py \
   test/registered/layers/test_layernorm_fusion.py
+
+PYTHONPATH=python python -m pytest -q \
+  test/registered/unit/layers/quantization/test_fp8_blockwise_linear_backends.py \
+  -k 'Modelopt'
 ```
 
-Expected: all selected tests pass; document skips and their hardware reason.
+Expected: all selected tests pass. The separate CPU mock dispatch class must
+run even without SM90; document skips and their hardware reason for the real
+ModelOpt numerical cases.
 
 **Step 3: Inspect diff and commit history**
 
