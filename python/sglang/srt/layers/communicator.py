@@ -458,6 +458,7 @@ class LayerCommunicator:
         force_layernorm_before_dp_gather: bool = False,
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
+        fused_ar_quant_linear: Optional[torch.nn.Module] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -468,6 +469,7 @@ class LayerCommunicator:
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
+        self.fused_ar_quant_linear = fused_ar_quant_linear
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -599,6 +601,21 @@ class LayerCommunicator:
                         quant_result = self.input_layernorm.forward_with_allreduce_fusion_quant_per_group(
                             hidden_states,
                             residual,
+                            use_attn_tp_group=False,
+                            keep_bf16=self.fused_ar_quant_keep_bf16,
+                        )
+                    elif (
+                        self.enable_fused_ar_quant
+                        and self.fused_ar_quant_linear is not None
+                        and hasattr(
+                            self.input_layernorm,
+                            "forward_with_allreduce_fusion_static_fp8_quant",
+                        )
+                    ):
+                        quant_result = self.input_layernorm.forward_with_allreduce_fusion_static_fp8_quant(
+                            hidden_states,
+                            residual,
+                            quant_linear=self.fused_ar_quant_linear,
                             use_attn_tp_group=False,
                             keep_bf16=self.fused_ar_quant_keep_bf16,
                         )
