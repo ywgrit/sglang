@@ -153,20 +153,14 @@ class TestModeloptFp8PrequantizedDispatch(CustomTestCase):
             sm120_gemv_alpha=torch.ones(1),
         )
         expected = torch.empty((2, 8), dtype=torch.bfloat16)
-        sm120_module = self._make_sm120_module()
 
         with (
-            mock.patch.dict(
-                sys.modules,
-                {"sglang.kernels.ops.gemm.sm120_fp8_gemv": sm120_module},
-            ),
             mock.patch.object(
                 modelopt_quant, "apply_fp8_linear", return_value=expected
             ) as fp8_linear,
             mock.patch.object(
                 modelopt_quant, "apply_fp8_linear_bmm_flashinfer"
             ) as flashinfer_bmm,
-            mock.patch.object(fp8_utils, "static_quant_fp8") as requantize,
         ):
             actual = method.apply(
                 layer, (qinput, input_scale, torch.bfloat16), bias=bias
@@ -183,8 +177,59 @@ class TestModeloptFp8PrequantizedDispatch(CustomTestCase):
             pre_quant_output_dtype=torch.bfloat16,
         )
         flashinfer_bmm.assert_not_called()
-        requantize.assert_not_called()
+
+    def test_sm120_eligible_tuple_still_dispatches_directly(self):
+        method = self._make_method()
+        qinput = torch.empty((1, 512), dtype=torch.float8_e4m3fn)
+        input_scale = torch.tensor(0.125)
+        row_major_weight = torch.empty(
+            (256, 512), dtype=torch.float8_e4m3fn
+        ).contiguous()
+        layer = types.SimpleNamespace(
+            # ModelOpt's processed layout is [K, N]; transposing it recovers
+            # the contiguous [N, K] weight required by the SM120 fast path.
+            weight=row_major_weight.t(),
+            weight_scale=torch.tensor(0.25),
+            input_scale=torch.tensor(0.5),
+            use_flashinfer_bmm=True,
+            sm120_gemv_alpha=torch.ones(1),
+        )
+        self.assertTrue(layer.weight.t().is_contiguous())
+        expected = torch.empty((1, 256), dtype=torch.bfloat16)
+        sm120_module = self._make_sm120_module()
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {"sglang.kernels.ops.gemm.sm120_fp8_gemv": sm120_module},
+            ),
+            mock.patch(
+                "sglang.kernels.ops.quantization.fp8_kernel.static_quant_fp8"
+            ) as sm120_requantize,
+            mock.patch.object(
+                modelopt_quant, "apply_fp8_linear", return_value=expected
+            ) as fp8_linear,
+            mock.patch.object(
+                modelopt_quant, "apply_fp8_linear_bmm_flashinfer"
+            ) as flashinfer_bmm,
+        ):
+            actual = method.apply(
+                layer, (qinput, input_scale, torch.bfloat16), bias=None
+            )
+
+        self.assertIs(actual, expected)
+        fp8_linear.assert_called_once_with(
+            input=qinput,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            input_scale=input_scale,
+            bias=None,
+            cutlass_fp8_supported=True,
+            pre_quant_output_dtype=torch.bfloat16,
+        )
+        flashinfer_bmm.assert_not_called()
         sm120_module.use_sm120_fp8_gemv.assert_not_called()
+        sm120_requantize.assert_not_called()
         sm120_module.sm120_fp8_gemv.assert_not_called()
 
     def test_marlin_rejects_tuple_before_accessing_rearranged_weights(self):
@@ -201,7 +246,10 @@ class TestModeloptFp8PrequantizedDispatch(CustomTestCase):
         fake_sglang_ops = types.SimpleNamespace(apply_fp8_marlin_linear=marlin_op)
         with (
             mock.patch.object(torch.ops, "sglang", fake_sglang_ops),
-            self.assertRaises(ValueError),
+            self.assertRaisesRegex(
+                TypeError,
+                r"(?i)(?:pre-quantized|tuple).*marlin|marlin.*(?:pre-quantized|tuple)",
+            ),
         ):
             method.apply(
                 PoisonedMarlinLayer(),
@@ -407,8 +455,12 @@ class TestModeloptFp8PerTensorLinear(_LinearBackendCheck):
     def test_prequantized_tuple_matches_bf16_and_skips_requantization(self):
         torch.manual_seed(11)
         layer, _ = self._build_layer(n=256, k=512)
-        layer.quant_method.process_weights_after_loading(layer)
         method = layer.quant_method
+        # On SM80-88 ModelOpt may select Marlin at construction time.  Disable
+        # it before weight processing so this test retains the static input
+        # scale and the standard processed FP8 weight layout.
+        method.use_marlin = False
+        method.process_weights_after_loading(layer)
 
         # Establish the ordinary static-FP8 result without either optional
         # specialized path, then hand the exact same quantized activation to
@@ -421,15 +473,12 @@ class TestModeloptFp8PerTensorLinear(_LinearBackendCheck):
             x, layer.input_scale, repeat_scale=False
         )
 
-        method.use_sm120_gemv = True
+        # The dedicated CPU/mock contract above covers a genuinely eligible
+        # SM120 M=1 layout; this numerical test isolates the BMM bypass and the
+        # generic apply_fp8_linear pre-quantized path.
+        method.use_sm120_gemv = False
         layer.use_flashinfer_bmm = True
-        layer.sm120_gemv_alpha = torch.ones(1, device="cuda")
-        sm120_module = TestModeloptFp8PrequantizedDispatch._make_sm120_module()
         with (
-            mock.patch.dict(
-                sys.modules,
-                {"sglang.kernels.ops.gemm.sm120_fp8_gemv": sm120_module},
-            ),
             mock.patch.object(
                 fp8_utils,
                 "static_quant_fp8",
@@ -446,8 +495,6 @@ class TestModeloptFp8PerTensorLinear(_LinearBackendCheck):
 
         requantize.assert_not_called()
         flashinfer_bmm.assert_not_called()
-        sm120_module.use_sm120_fp8_gemv.assert_not_called()
-        sm120_module.sm120_fp8_gemv.assert_not_called()
         self.assertEqual(output.shape, reference.shape)
         self.assertEqual(output.dtype, torch.bfloat16)
         assert_output_close(self, output, reference, rtol=5e-2, atol=1e-1)
