@@ -467,21 +467,35 @@ class FlashInferWorkspaceManager:
         self._max_token_num_seen = max(max_token_num, self._max_token_num_seen or 0)
         self._max_hidden_dim_seen = max(hidden_dim, self._max_hidden_dim_seen or 0)
 
-        # Reuse existing workspace if it already covers this problem size
-        if (
+        effective_dtype = dtype or torch.bfloat16
+        requested_group = (device_group, cpu_group)
+
+        # Check the full rendezvous identity before consulting the backend's
+        # opaque size validator. A workspace for different peers, rank,
+        # backend, or dtype must never be considered reusable merely because
+        # it has sufficient byte capacity.
+        identity_matches = (
             self.initialized
+            and self.workspace is not None
             and self.world_size == world_size
-            and self.is_buffer_size_sufficient(
+            and self.rank == rank
+            and self.group == requested_group
+            and self.backend == backend
+            and self.dtype == effective_dtype
+        )
+        if identity_matches:
+            if self.is_buffer_size_sufficient(
                 token_num=max_token_num,
                 hidden_dim=hidden_dim,
-                dtype=dtype or torch.bfloat16,
+                dtype=effective_dtype,
                 use_oneshot=use_oneshot,
-            )
-        ):
-            return
+            ):
+                return
 
-        # Same world_size but buffer too small: free old workspace before creating new
-        if self.initialized and self.world_size == world_size:
+        # Any initialized workspace that reaches this point is either too
+        # small or has a different identity. Release it before rendezvousing
+        # on the requested groups.
+        if self.initialized:
             self.cleanup()
 
         if _flashinfer_comm is None or _create_allreduce_fusion_workspace is None:
@@ -496,7 +510,7 @@ class FlashInferWorkspaceManager:
             world_size=world_size,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
-            dtype=dtype,
+            dtype=effective_dtype,
             cpu_group=cpu_group,
         ):
             _flashinfer_allreduce_unavailable = True
@@ -530,7 +544,7 @@ class FlashInferWorkspaceManager:
                 rank=rank,
                 max_token_num=alloc_token_num,
                 hidden_dim=alloc_hidden_dim,
-                dtype=dtype or torch.bfloat16,
+                dtype=effective_dtype,
                 gpus_per_node=gpus_per_node,
             )
             if (
@@ -555,7 +569,7 @@ class FlashInferWorkspaceManager:
             self.group = (device_group, cpu_group)
             self.max_token_num = alloc_token_num
             self.hidden_dim = alloc_hidden_dim
-            self.dtype = dtype or torch.bfloat16
+            self.dtype = effective_dtype
             self.backend = self.workspace.backend
             self.use_fp32_lamport = (
                 self.workspace.metadata["use_fp32_lamport"]
@@ -796,6 +810,8 @@ def ensure_workspace_initialized(
         or workspace_manager.world_size != world_size
         or workspace_manager.rank != rank
         or workspace_manager.group != group_key
+        or workspace_manager.backend != backend
+        or workspace_manager.dtype != effective_dtype
         or not workspace_manager.is_buffer_size_sufficient(
             token_num=token_num,
             hidden_dim=hidden_dim,
@@ -963,7 +979,6 @@ def fake_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op(
 
 
 @register_custom_op(
-    mutates_args=["input_tensor", "residual", "weight"],
     fake_impl=fake_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op,
 )
 def _flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op(
@@ -1023,6 +1038,36 @@ def _flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op(
     return quant_out, residual_out, norm_out
 
 
+def _is_static_fp8_workspace_eligible(
+    workspace_manager: FlashInferWorkspaceManager,
+    *,
+    expected_world_size: int,
+    expected_rank: int,
+    expected_group_key: Tuple[Optional[ProcessGroup], Optional[ProcessGroup]],
+    expected_dtype: torch.dtype,
+    token_num: int,
+    hidden_dim: int,
+) -> bool:
+    """Check cached workspace identity and capacity without backend calls.
+
+    This predicate deliberately reads only Python metadata populated during
+    workspace initialization. In particular, it never invokes FlashInfer's
+    opaque size validator, so it is safe while Dynamo/FakeTensor tracing.
+    """
+    return bool(
+        workspace_manager.initialized
+        and workspace_manager.workspace is not None
+        and workspace_manager.world_size == expected_world_size
+        and workspace_manager.rank == expected_rank
+        and workspace_manager.group == expected_group_key
+        and workspace_manager.dtype == expected_dtype
+        and workspace_manager.max_token_num is not None
+        and workspace_manager.hidden_dim is not None
+        and token_num <= workspace_manager.max_token_num
+        and hidden_dim <= workspace_manager.hidden_dim
+    )
+
+
 def try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
@@ -1051,7 +1096,7 @@ def try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
     ):
         return None, None, None
 
-    world_size, _, _ = _get_allreduce_group(use_attn_tp_group)
+    world_size, rank, coordinator = _get_allreduce_group(use_attn_tp_group)
     if world_size <= 1:
         return None, None, None
     if not _is_allreduce_quant_capability_available_for_group(
@@ -1061,6 +1106,7 @@ def try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
 
     if (
         input_tensor.dim() != 2
+        or input_tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32)
         or residual.shape != input_tensor.shape
         or residual.dtype != input_tensor.dtype
         or residual.device != input_tensor.device
@@ -1087,6 +1133,33 @@ def try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
     if input_tensor.shape[0] > max_token_num:
         return None, None, None
 
+    expected_group_key = (coordinator.device_group, coordinator.cpu_group)
+    if torch.compiler.is_compiling():
+        workspace_manager = _get_workspace_manager(use_attn_tp_group)
+        if not _is_static_fp8_workspace_eligible(
+            workspace_manager,
+            expected_world_size=world_size,
+            expected_rank=rank,
+            expected_group_key=expected_group_key,
+            expected_dtype=input_tensor.dtype,
+            token_num=input_tensor.shape[0],
+            hidden_dim=input_tensor.shape[-1],
+        ):
+            return None, None, None
+        return _flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op(
+            input_tensor=input_tensor,
+            residual=residual,
+            weight=weight,
+            scale_factor=scale_factor,
+            eps=eps,
+            max_token_num=max_token_num,
+            use_oneshot=use_oneshot,
+            trigger_completion_at_end=trigger_completion_at_end,
+            fp32_acc=fp32_acc,
+            use_attn_tp_group=use_attn_tp_group,
+            keep_bf16=keep_bf16,
+        )
+
     if not ensure_workspace_initialized(
         max_token_num=max_token_num,
         hidden_dim=input_tensor.shape[-1],
@@ -1099,8 +1172,19 @@ def try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
         return None, None, None
 
     workspace_manager = _get_workspace_manager(use_attn_tp_group)
-    if workspace_manager.workspace is None:
-        return None, None, None
+    if not _is_static_fp8_workspace_eligible(
+        workspace_manager,
+        expected_world_size=world_size,
+        expected_rank=rank,
+        expected_group_key=expected_group_key,
+        expected_dtype=input_tensor.dtype,
+        token_num=input_tensor.shape[0],
+        hidden_dim=input_tensor.shape[-1],
+    ):
+        raise RuntimeError(
+            "FlashInfer static FP8 workspace invariants changed after "
+            "synchronized initialization"
+        )
 
     return _flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op(
         input_tensor=input_tensor,
