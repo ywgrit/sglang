@@ -34,6 +34,29 @@ _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
+_flashinfer_allreduce_quant_available = False
+_flashinfer_allreduce_quant_capability_by_group = {}
+
+
+def _supports_allreduce_rmsnorm_static_fp8_quant(comm) -> bool:
+    """Whether ``comm`` exposes the pinned static-FP8 fusion API."""
+    try:
+        patterns = comm.AllReduceFusionPattern
+        if not all(
+            hasattr(patterns, name)
+            for name in (
+                "kARResidualRMSNormFP8Quant",
+                "kARResidualRMSNormOutFP8Quant",
+            )
+        ):
+            return False
+        parameters = inspect.signature(comm.allreduce_fusion).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+    return all(
+        name in parameters for name in ("quant_out", "scale_factor", "weight_bias")
+    )
 
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
@@ -103,6 +126,14 @@ if is_flashinfer_available():
             _flashinfer_allreduce_supports_trigger_completion = (
                 "trigger_completion_at_end" in allreduce_params
             )
+            _flashinfer_allreduce_quant_available = (
+                _supports_allreduce_rmsnorm_static_fp8_quant(comm)
+            )
+            if not _flashinfer_allreduce_quant_available:
+                logger.debug(
+                    "flashinfer.comm static FP8 allreduce fusion API is not "
+                    "available; plain allreduce fusion remains enabled"
+                )
         else:
             _flashinfer_allreduce_unavailable = True
             logger.warning(
@@ -641,8 +672,54 @@ def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManage
     return manager
 
 
-def _sync_allreduce_unavailable_across_tp():
-    """Synchronize _flashinfer_allreduce_unavailable across all TP ranks.
+def _get_allreduce_group(use_attn_tp_group: bool):
+    """Return the exact world size, rank, and coordinator used by fusion."""
+    parallel = get_parallel()
+    if use_attn_tp_group:
+        coordinator = get_attn_tp_group()
+        size_name, rank_name = "attn_tp_size", "attn_tp_rank"
+    elif parallel.moe_ep_size > 1:
+        coordinator = get_moe_ep_group()
+        size_name, rank_name = "moe_ep_size", "moe_ep_rank"
+    else:
+        coordinator = get_moe_tp_group()
+        size_name, rank_name = "moe_tp_size", "moe_tp_rank"
+    world_size = getattr(parallel, size_name, coordinator.world_size)
+    rank = getattr(parallel, rank_name, getattr(coordinator, "rank_in_group", 0))
+    return world_size, rank, coordinator
+
+
+def _synchronize_allreduce_quant_capability(use_attn_tp_group: bool) -> bool:
+    """Collectively cache static-FP8 support for the exact fusion group."""
+    world_size, _, coordinator = _get_allreduce_group(use_attn_tp_group)
+    if world_size <= 1:
+        return False
+
+    flag = torch.tensor(
+        [0 if _flashinfer_allreduce_quant_available else 1],
+        dtype=torch.int32,
+        device="cpu",
+    )
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=coordinator.cpu_group)
+    available = flag.item() == 0
+    _flashinfer_allreduce_quant_capability_by_group[coordinator.cpu_group] = available
+    return available
+
+
+def _is_allreduce_quant_capability_available_for_group(
+    use_attn_tp_group: bool,
+) -> bool:
+    """Read the startup capability vote without issuing a collective."""
+    world_size, _, coordinator = _get_allreduce_group(use_attn_tp_group)
+    if world_size <= 1:
+        return False
+    return _flashinfer_allreduce_quant_capability_by_group.get(
+        coordinator.cpu_group, False
+    )
+
+
+def _sync_allreduce_unavailable_across_tp(use_attn_tp_group: bool = True):
+    """Synchronize _flashinfer_allreduce_unavailable across the exact group.
 
     If workspace initialization fails on any rank, all ranks must agree to
     disable fusion. Otherwise ranks diverge during CUDA graph capture: some
@@ -654,14 +731,15 @@ def _sync_allreduce_unavailable_across_tp():
     try:
         import torch.distributed as dist
 
-        tp_group = get_tp_group()
-        if tp_group.world_size <= 1:
+        world_size, _, coordinator = _get_allreduce_group(use_attn_tp_group)
+        if world_size <= 1:
             return
         flag = torch.tensor(
             [1 if _flashinfer_allreduce_unavailable else 0],
             dtype=torch.int32,
+            device="cpu",
         )
-        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=tp_group.cpu_group)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=coordinator.cpu_group)
         if flag.item() > 0 and not _flashinfer_allreduce_unavailable:
             _flashinfer_allreduce_unavailable = True
             logger.warning(
@@ -688,19 +766,7 @@ def ensure_workspace_initialized(
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
 
-    if use_attn_tp_group:
-        world_size = get_parallel().attn_tp_size
-        rank = get_parallel().attn_tp_rank
-        coordinator = get_attn_tp_group()
-    else:
-        if get_parallel().moe_ep_size > 1:
-            world_size = get_parallel().moe_ep_size
-            rank = get_parallel().moe_ep_rank
-            coordinator = get_moe_ep_group()
-        else:
-            world_size = get_parallel().moe_tp_size
-            rank = get_parallel().moe_tp_rank
-            coordinator = get_moe_tp_group()
+    world_size, rank, coordinator = _get_allreduce_group(use_attn_tp_group)
 
     # Always pass the coordinator's groups: flashinfer >=0.6.10 reads the
     # rendezvous group from `group=...` (falling back to WORLD when None),
@@ -747,7 +813,7 @@ def ensure_workspace_initialized(
             cpu_group=cpu_group,
         )
 
-        _sync_allreduce_unavailable_across_tp()
+        _sync_allreduce_unavailable_across_tp(use_attn_tp_group)
 
     return workspace_manager.initialized
 
@@ -992,6 +1058,9 @@ def pre_initialize_workspaces(
     (broadcasts, barriers) inside the graph capture context, which can
     deadlock with custom_all_reduce.register_graph_buffers.
     """
+    _synchronize_allreduce_quant_capability(False)
+    _synchronize_allreduce_quant_capability(True)
+
     if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
         return
 
