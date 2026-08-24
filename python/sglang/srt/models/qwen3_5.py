@@ -281,6 +281,44 @@ def _fused_ar_quant_communicator_kwargs(
     }
 
 
+def _fused_hidden_states_token_count(hidden_states) -> int:
+    if isinstance(hidden_states, torch.Tensor):
+        return hidden_states.shape[0]
+
+    tensor_slots = None
+    if isinstance(hidden_states, tuple) and hidden_states:
+        if len(hidden_states) == 2:
+            tensor_slots = hidden_states
+        elif len(hidden_states) == 3 and isinstance(
+            hidden_states[-1], torch.dtype
+        ):
+            tensor_slots = hidden_states[:2]
+        elif len(hidden_states) == 3:
+            tensor_slots = hidden_states
+        elif len(hidden_states) == 4 and isinstance(
+            hidden_states[-1], torch.dtype
+        ):
+            tensor_slots = hidden_states[:3]
+    if tensor_slots is not None and all(
+        isinstance(item, torch.Tensor) for item in tensor_slots
+    ):
+        return hidden_states[0].shape[0]
+    raise TypeError("fused hidden states must be a tensor or fused AR tuple")
+
+
+def _gdn_fused_ar_dual_output_bf16(hidden_states) -> torch.Tensor:
+    if isinstance(hidden_states, tuple):
+        is_amd = len(hidden_states) == 3 and not isinstance(
+            hidden_states[-1], torch.dtype
+        )
+        is_cuda = len(hidden_states) == 4 and isinstance(
+            hidden_states[-1], torch.dtype
+        )
+        if (is_amd or is_cuda) and isinstance(hidden_states[0], torch.Tensor):
+            return hidden_states[0]
+    raise TypeError("GDN fused AR quant input must be a dual-output tuple")
+
+
 def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     if not isinstance(hidden_states, tuple):
         return hidden_states
@@ -709,8 +747,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _forward_input_proj_fused_quant(self, hidden_states):
         """Project a fused-AR tuple into its exact QKVZ and BA consumers."""
-        hs_bf16 = hidden_states[0]
-        hs_qkvz = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvz)
+        hs_bf16 = _gdn_fused_ar_dual_output_bf16(hidden_states)
+        try:
+            hs_qkvz = _select_fused_ar_input_for_linear(
+                hidden_states, self.in_proj_qkvz
+            )
+        except TypeError as exc:
+            raise TypeError(
+                "GDN fused AR quant input must be a dual-output tuple"
+            ) from exc
         seq_len = hs_bf16.shape[0]
 
         if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
@@ -951,7 +996,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and _fused_hidden_states_token_count(hidden_states) > 0
+        ):
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -1359,7 +1407,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and _fused_hidden_states_token_count(hidden_states) > 0
+        ):
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
