@@ -40,19 +40,62 @@ class _RecordingNorm(torch.nn.Module):
         self.per_group_calls = []
         self.events = []
 
-    def forward_with_allreduce_fusion_static_fp8_quant(self, *args, **kwargs):
+    def forward_with_allreduce_fusion_static_fp8_quant(
+        self,
+        x,
+        residual=None,
+        quant_linear=None,
+        use_attn_tp_group=True,
+        keep_bf16=False,
+    ):
         self.events.append("static")
-        self.static_calls.append((args, kwargs))
+        self.static_calls.append(
+            {
+                "x": x,
+                "residual": residual,
+                "quant_linear": quant_linear,
+                "use_attn_tp_group": use_attn_tp_group,
+                "keep_bf16": keep_bf16,
+            }
+        )
         return self.static_result
 
-    def forward_with_allreduce_fusion(self, *args, **kwargs):
+    def forward_with_allreduce_fusion(
+        self,
+        x,
+        residual=None,
+        post_residual_addition=None,
+        use_attn_tp_group=True,
+    ):
         self.events.append("ordinary")
-        self.ordinary_calls.append((args, kwargs))
+        self.ordinary_calls.append(
+            {
+                "x": x,
+                "residual": residual,
+                "post_residual_addition": post_residual_addition,
+                "use_attn_tp_group": use_attn_tp_group,
+            }
+        )
         return self.ordinary_result
 
-    def forward_with_allreduce_fusion_quant_per_group(self, *args, **kwargs):
+    def forward_with_allreduce_fusion_quant_per_group(
+        self,
+        x,
+        residual=None,
+        group_size=128,
+        use_attn_tp_group=True,
+        keep_bf16=False,
+    ):
         self.events.append("per_group")
-        self.per_group_calls.append((args, kwargs))
+        self.per_group_calls.append(
+            {
+                "x": x,
+                "residual": residual,
+                "group_size": group_size,
+                "use_attn_tp_group": use_attn_tp_group,
+                "keep_bf16": keep_bf16,
+            }
+        )
         return self.per_group_result
 
 
@@ -144,13 +187,15 @@ class TestPrepareAttnStaticFp8Fusion(CustomTestCase):
         residual = torch.tensor([[3.0, 4.0]])
         return hidden_states, residual
 
-    def _assert_call(self, calls, hidden_states, residual, expected_kwargs):
+    def _assert_call(self, calls, **expected_values):
         self.assertEqual(len(calls), 1)
-        args, kwargs = calls[0]
-        self.assertEqual(len(args), 2)
-        self.assertIs(args[0], hidden_states)
-        self.assertIs(args[1], residual)
-        self.assertEqual(kwargs, expected_kwargs)
+        actual_values = calls[0]
+        for name, expected_value in expected_values.items():
+            self.assertIn(name, actual_values)
+            if name in ("x", "residual", "quant_linear"):
+                self.assertIs(actual_values[name], expected_value)
+            else:
+                self.assertEqual(actual_values[name], expected_value)
 
     def test_constructor_preserves_exact_fused_ar_quant_consumer(self):
         consumer = torch.nn.Identity()
@@ -165,6 +210,11 @@ class TestPrepareAttnStaticFp8Fusion(CustomTestCase):
         with (
             patch.object(comm.CommunicateContext, "init_new", return_value=context),
             patch.object(LayerCommunicator, "_post_init_communicate"),
+            patch.object(
+                comm,
+                "get_spec",
+                return_value=types.SimpleNamespace(speculative_algorithm=None),
+            ),
             patch.object(
                 comm.SpeculativeAlgorithm,
                 "from_string",
@@ -183,7 +233,12 @@ class TestPrepareAttnStaticFp8Fusion(CustomTestCase):
     def test_cuda_static_fp8_fusion_receives_consumer_and_returns_its_tuple(self):
         hidden_states, residual = self._inputs()
         consumer = torch.nn.Identity()
-        static_hidden = (torch.tensor([[5]], dtype=torch.uint8), torch.tensor(0.25))
+        static_hidden = (
+            torch.tensor([[5.0, 6.0]]),
+            torch.tensor([[7]], dtype=torch.uint8),
+            torch.tensor(0.25),
+            hidden_states.dtype,
+        )
         static_residual = torch.tensor([[6.0, 7.0]])
         ordinary_result = (
             torch.tensor([[8.0, 9.0]]),
@@ -208,13 +263,11 @@ class TestPrepareAttnStaticFp8Fusion(CustomTestCase):
 
         self._assert_call(
             norm.static_calls,
-            hidden_states,
-            residual,
-            {
-                "quant_linear": consumer,
-                "use_attn_tp_group": False,
-                "keep_bf16": True,
-            },
+            x=hidden_states,
+            residual=residual,
+            quant_linear=consumer,
+            use_attn_tp_group=False,
+            keep_bf16=True,
         )
         self.assertEqual(norm.events, ["static"])
         self.assertIs(result[0], static_hidden)
@@ -244,19 +297,17 @@ class TestPrepareAttnStaticFp8Fusion(CustomTestCase):
         self.assertIs(result[1], ordinary_residual)
         self._assert_call(
             norm.static_calls,
-            hidden_states,
-            residual,
-            {
-                "quant_linear": consumer,
-                "use_attn_tp_group": False,
-                "keep_bf16": False,
-            },
+            x=hidden_states,
+            residual=residual,
+            quant_linear=consumer,
+            use_attn_tp_group=False,
+            keep_bf16=False,
         )
         self._assert_call(
             norm.ordinary_calls,
-            hidden_states,
-            residual,
-            {"use_attn_tp_group": False},
+            x=hidden_states,
+            residual=residual,
+            use_attn_tp_group=False,
         )
         self.assertEqual(norm.events, ["static", "ordinary"])
         self.assertEqual(norm.per_group_calls, [])
@@ -282,9 +333,9 @@ class TestPrepareAttnStaticFp8Fusion(CustomTestCase):
         self.assertEqual(norm.static_calls, [])
         self._assert_call(
             norm.ordinary_calls,
-            hidden_states,
-            residual,
-            {"use_attn_tp_group": False},
+            x=hidden_states,
+            residual=residual,
+            use_attn_tp_group=False,
         )
         self.assertEqual(norm.events, ["ordinary"])
         self.assertEqual(norm.per_group_calls, [])
@@ -315,9 +366,9 @@ class TestPrepareAttnStaticFp8Fusion(CustomTestCase):
         self.assertEqual(norm.static_calls, [])
         self._assert_call(
             norm.ordinary_calls,
-            hidden_states,
-            residual,
-            {"use_attn_tp_group": False},
+            x=hidden_states,
+            residual=residual,
+            use_attn_tp_group=False,
         )
         self.assertEqual(norm.events, ["ordinary"])
         self.assertEqual(norm.per_group_calls, [])
@@ -350,9 +401,10 @@ class TestPrepareAttnStaticFp8Fusion(CustomTestCase):
         self.assertIs(result[1], per_group_residual)
         self._assert_call(
             norm.per_group_calls,
-            hidden_states,
-            residual,
-            {"use_attn_tp_group": False, "keep_bf16": True},
+            x=hidden_states,
+            residual=residual,
+            use_attn_tp_group=False,
+            keep_bf16=True,
         )
         self.assertEqual(norm.events, ["per_group"])
         self.assertEqual(norm.static_calls, [])
