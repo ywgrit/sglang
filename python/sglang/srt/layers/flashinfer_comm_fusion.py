@@ -718,8 +718,8 @@ def _is_allreduce_quant_capability_available_for_group(
     )
 
 
-def _sync_allreduce_unavailable_across_tp(use_attn_tp_group: bool = True):
-    """Synchronize _flashinfer_allreduce_unavailable across the exact group.
+def _sync_allreduce_unavailable_across_tp():
+    """Synchronize _flashinfer_allreduce_unavailable across all TP ranks.
 
     If workspace initialization fails on any rank, all ranks must agree to
     disable fusion. Otherwise ranks diverge during CUDA graph capture: some
@@ -731,15 +731,15 @@ def _sync_allreduce_unavailable_across_tp(use_attn_tp_group: bool = True):
     try:
         import torch.distributed as dist
 
-        world_size, _, coordinator = _get_allreduce_group(use_attn_tp_group)
-        if world_size <= 1:
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
             return
         flag = torch.tensor(
             [1 if _flashinfer_allreduce_unavailable else 0],
             dtype=torch.int32,
             device="cpu",
         )
-        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=coordinator.cpu_group)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=tp_group.cpu_group)
         if flag.item() > 0 and not _flashinfer_allreduce_unavailable:
             _flashinfer_allreduce_unavailable = True
             logger.warning(
@@ -813,7 +813,7 @@ def ensure_workspace_initialized(
             cpu_group=cpu_group,
         )
 
-        _sync_allreduce_unavailable_across_tp(use_attn_tp_group)
+        _sync_allreduce_unavailable_across_tp()
 
     return workspace_manager.initialized
 

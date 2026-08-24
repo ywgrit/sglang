@@ -289,6 +289,54 @@ class TestFlashInferAllReduceQuantCapability(CustomTestCase):
             self.assertEqual(synchronize.call_args_list, [call(False), call(True)])
             initialize.assert_not_called()
 
+    def test_hybrid_ep_failure_is_voted_across_enclosing_tp(self):
+        tp_cpu_group = object()
+
+        for local_unavailable in (False, True):
+            def emulate_tp_vote(flag, *, op, group):
+                self.assertEqual(flag.item(), int(local_unavailable))
+                self.assertIs(op, fusion.dist.ReduceOp.MAX)
+                self.assertIs(group, tp_cpu_group)
+                # Model a failure from one of the partitioned EP subgroups.
+                flag.fill_(1)
+
+            with (
+                self.subTest(local_unavailable=local_unavailable),
+                patch.object(
+                    fusion,
+                    "_flashinfer_allreduce_unavailable",
+                    local_unavailable,
+                ),
+                patch.object(
+                    fusion,
+                    "get_tp_group",
+                    return_value=types.SimpleNamespace(
+                        world_size=4, cpu_group=tp_cpu_group
+                    ),
+                ),
+                patch.object(
+                    fusion,
+                    "_get_allreduce_group",
+                    side_effect=AssertionError(
+                        "the global unavailable vote must not use an EP subgroup"
+                    ),
+                ),
+                patch.object(
+                    fusion.dist,
+                    "all_reduce",
+                    side_effect=emulate_tp_vote,
+                ) as all_reduce,
+            ):
+                fusion._sync_allreduce_unavailable_across_tp()
+
+                self.assertTrue(fusion._flashinfer_allreduce_unavailable)
+                all_reduce.assert_called_once()
+                # Every TP rank now takes the same later attention fallback
+                # before consulting its exact attention workspace group.
+                self.assertFalse(
+                    fusion.ensure_workspace_initialized(use_attn_tp_group=True)
+                )
+
 
 def _torch_allreduce_residual_rmsnorm_baseline(
     input_tensor, residual, weight, world_size, eps
