@@ -82,7 +82,7 @@ Expected code surfaces:
 - `python/sglang/srt/layers/flashinfer_comm_fusion.py`
 - `python/sglang/srt/layers/layernorm.py`
 - `python/sglang/srt/layers/communicator.py`
-- the minimum model wiring needed for Qwen3.5/NemotronH single-consumer input projections
+- Qwen3.5 full-attention QKV quant-only wiring and GDN explicit dual-output wiring; NemotronH is included only after each projection's consumer contract is verified
 - `test/registered/unit/layers/test_flashinfer_comm_fusion.py`
 - focused layernorm/communicator/model unit tests
 - a small two-rank benchmark or extension of the existing communication benchmark
@@ -99,7 +99,7 @@ Correctness contract:
 
 - Residual output matches the non-quantizing fused path within the existing norm tolerance.
 - Fused quant output matches `static_quant_fp8(nonquant_norm, input_scale)` under the same scale convention, not merely a dequantized cosine check.
-- Standard RMSNorm and Gemma/Qwen3.5 `weight_bias=1.0` semantics are tested separately.
+- Standard RMSNorm and Gemma/Qwen3.5 semantics are tested separately. The implementation must choose exactly one weight representation: raw `weight` with FlashInfer `weight_bias=1.0`, or the existing pre-added `gemma_weight` with `weight_bias=0.0`. Passing `gemma_weight` with a second bias is forbidden.
 - Downstream linear output dtype remains the original activation dtype.
 - FP16/BF16, scale dtype/device/contiguity, quant-only tuples, and BF16-plus-FP8 dual output are covered.
 - Downstream GEMM and a fixed model-level output/logit gate agree with the baseline within the declared FP8 tolerance.
@@ -107,7 +107,7 @@ Correctness contract:
 
 Collective-safe eligibility and fallback:
 
-- Exact FlashInfer enum and call-signature support for `quant_out`, `scale_factor`, and the selected pattern is probed before any collective.
+- Exact FlashInfer enum and call-signature support for `quant_out`, `scale_factor`, `weight_bias`, and the selected pattern is probed before any collective.
 - Backend, workspace capacity, process-group identity, dtype, shape, scale, and tuple-mode decisions are derived from rank-invariant metadata. Availability failures discovered during initialization are synchronized across the participating ranks.
 - A rank may use the existing non-quantizing fused path only when every rank makes the same pre-collective decision.
 - Once the quantizing collective is launched, errors fail fast. There is no catch-and-fallback path after one rank may have entered the kernel.
@@ -133,17 +133,17 @@ This is a separate PR because it changes a different kernel and producer contrac
 
 Tests cover gate-before/after-norm semantics, head/group shapes, FP16/BF16, residual absence, FP8 saturation, downstream output parity, and CUDA Graph replay. Benchmarks report isolated kernel latency, removed launches, memory traffic where counters are available, and end-to-end decode.
 
-### PR 3 — Whisper compiled/fused encoder profiling spike
+### PR 3 — Qwen3-TTS mixed sampled/argmax Predictor graph retention
 
 Repository: `sgl-project/sglang-omni`
 
-Upstream reference: ASR roadmap #1396, W-PR6
+Upstream reference: issue #1418, section 6
 
-Goal: qualify one concrete compiled or fused Whisper encoder change on top of the landed bucketed encoder CUDA Graph work.
+Goal: keep mixed batches containing sampled and argmax rows on the Predictor CUDA Graph path while preserving exact per-row sampling semantics.
 
-This slot begins as a spike, not as an implementation-ready PR. First profile current main together with the effects already covered by open Whisper PRs #1510 and #1589. Then choose exactly one of: compile then capture, compile with encoder graph disabled, or a single measured kernel fusion. The promotion note must name the function, stable input domain, selected compile/graph ordering, eager fallback, and isolated headroom. If no option clears the noise gate, use a ranked fallback.
+Current `_predictor_graph_signature` deliberately rejects mixed batches because sampled-row tensors have count-dependent shapes. The candidate first profiles the frequency and cost of this fallback. If material, replace the shape-changing sub-batch path with a fixed full-batch masked sampling contract: sampled rows execute the seeded categorical path, argmax rows retain the exact eager tie-breaking result, and inactive padded rows cannot alter RNG position or output. Graph keys remain bounded by batch bucket and sampling-shape signature rather than the exact row mask.
 
-Tests cover the selected ordering, bucket hits/misses, eager fallback, output parity, and graph/compile lifetime. Benchmark gates include WER/CER, encoder latency, requests/s, mean/p95 latency, compile warm-up/capture cost, and peak memory.
+Tests cover all-argmax, all-sampled, alternating and sparse sampled masks, bucket padding, per-row top-k/top-p/temperature, semantic positions, deterministic seeds, graph reuse after row-mask changes, eager fallback, and exact token/embedding identity. Benchmarks report mixed-batch graph hit rate, Predictor kernel/launch count, step latency, end-to-end requests/s, TTFA, and generated-audio quality. If mixed batches are rare or the full-batch sampling cost cancels graph savings, this slot falls back.
 
 ### PR 4 — Qwen3-TTS reference-encode service batching
 
@@ -153,7 +153,7 @@ Upstream reference: issue #1418, section 6
 
 Goal: add service-level batching for Qwen3-TTS reference encoding only if a cold unique-voice workload shows material encoder headroom.
 
-Open PR #1625 already implements uploaded-voice single-flight and must not be duplicated. This candidate starts from current main plus the eventual #1625 outcome, profiles unique-key cold requests, and implements `can_encode_batch`/batched hook behavior only when padding, masking, output splitting, cache insertion, cancellation, and failure isolation can be made equivalent to independent encodes.
+Open PR #1625 already implements uploaded-voice single-flight and must not be duplicated. This candidate branches from then-current main and targets `_Qwen3TTSAdhocReferenceHook.can_encode_batch` / `encode_batch`, configures `ReferenceEncodeService(max_batch_size, max_batch_wait_ms)`, and reuses `_Qwen3TTSRefCodeBatcher` to batch the speaker-embedding work that remains per request. It proceeds only when profiling shows material unique-key cold-request headroom and when padding, masking, output splitting, cache insertion, cancellation, and failure isolation are equivalent to independent encodes.
 
 Tests cover variable reference lengths, batch formation, output-to-request mapping, per-item failure, cancellation, cache insertion, and batched-vs-independent parity. Benchmarks report encoder invocation count, achieved batch size, cold unique-voice throughput, mean/p95 latency, and memory. If profiling shows batching cannot amortize the work, this slot falls back.
 
