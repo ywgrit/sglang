@@ -263,11 +263,25 @@ call site unchanged, but add a test proving capability sync occurs before the
 early return even when the local `_flashinfer_comm` is absent. This avoids any
 CPU collective in layer forward or graph replay.
 
-Refactor `_sync_allreduce_unavailable_across_tp` to accept
-`use_attn_tp_group`, select the same exact coordinator, and sync on its
-`cpu_group`; update `ensure_workspace_initialized` to pass the argument. This
-keeps workspace failure fallback rank-invariant for attention TP, EP, and MoE
-TP rather than always syncing the global TP group.
+Keep `_sync_allreduce_unavailable_across_tp` on the enclosing TP CPU group.
+The flag it synchronizes is process-global and disables both MoE and attention
+fusion, so an exact EP-subgroup vote can leave crossing attention-TP ranks in
+different paths and deadlock. The vote must encode the complete local unusable
+condition (`_flashinfer_allreduce_unavailable or _flashinfer_comm is None`) and
+store the MAX-reduced result back into the global flag. Workspace rendezvous
+and quant capability caching remain scoped to the exact attention-TP, EP, or
+MoE-TP group.
+
+At startup the collective order on every TP rank is:
+
+1. exact MoE-group quant capability vote;
+2. exact attention-TP quant capability vote;
+3. enclosing TP unavailable vote;
+4. only then the unavailable/missing-comm early return and workspace setup.
+
+Add hybrid TP+EP and missing-local-comm regressions for this ordering. A rank
+with no FlashInfer comm must not return while healthy peers enter workspace
+collectives.
 
 **Step 2: Set the flag during the existing import probe**
 
