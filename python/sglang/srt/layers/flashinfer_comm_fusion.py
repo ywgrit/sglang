@@ -939,6 +939,184 @@ def flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
+def fake_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale_factor: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+    keep_bf16: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    residual_out = torch.empty_like(residual)
+    norm_out = (
+        torch.empty_like(input_tensor)
+        if keep_bf16
+        else input_tensor.new_empty((0,))
+    )
+    return quant_out, residual_out, norm_out
+
+
+@register_custom_op(
+    mutates_args=["input_tensor", "residual", "weight"],
+    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op,
+)
+def _flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale_factor: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+    keep_bf16: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Launch fused allreduce, residual RMSNorm, and static FP8 quantization.
+
+    The public preflight wrapper below guarantees workspace and tensor
+    eligibility before this tensor-only custom op is entered. Once entered,
+    failures must propagate to every caller rather than causing only one rank
+    to fall back after a collective has started.
+    """
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+    assert workspace_manager.workspace is not None
+
+    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    residual_out = torch.empty_like(residual)
+    norm_out = (
+        torch.empty_like(input_tensor)
+        if keep_bf16
+        else input_tensor.new_empty((0,))
+    )
+    pattern = (
+        _flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant
+        if keep_bf16
+        else _flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNormFP8Quant
+    )
+    kwargs = dict(
+        input=input_tensor,
+        workspace=workspace_manager.workspace,
+        pattern=pattern,
+        launch_with_pdl=True,
+        residual_out=residual_out,
+        norm_out=norm_out if keep_bf16 else None,
+        quant_out=quant_out,
+        scale_factor=scale_factor,
+        residual_in=residual,
+        rms_gamma=weight,
+        rms_eps=eps,
+        weight_bias=0.0,
+        use_oneshot=use_oneshot,
+        fp32_acc=fp32_acc,
+    )
+    if _flashinfer_allreduce_supports_trigger_completion:
+        kwargs["trigger_completion_at_end"] = trigger_completion_at_end
+    _flashinfer_comm.allreduce_fusion(**kwargs)
+    return quant_out, residual_out, norm_out
+
+
+def try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale_factor: Optional[torch.Tensor],
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+    keep_bf16: bool = False,
+) -> Tuple[
+    Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
+]:
+    """Try fused allreduce + residual RMSNorm + static per-tensor FP8 quant.
+
+    Every fallback decision is made before workspace initialization or the
+    registered custom op. This keeps all ranks on the same collective path and
+    leaves the custom-op schema tensor-only for CUDA graph/FakeTensor support.
+    """
+    if (
+        _flashinfer_allreduce_unavailable
+        or not is_flashinfer_available()
+        or _flashinfer_comm is None
+    ):
+        return None, None, None
+
+    world_size, _, _ = _get_allreduce_group(use_attn_tp_group)
+    if world_size <= 1:
+        return None, None, None
+    if not _is_allreduce_quant_capability_available_for_group(
+        use_attn_tp_group
+    ):
+        return None, None, None
+
+    if (
+        input_tensor.dim() != 2
+        or residual.shape != input_tensor.shape
+        or residual.dtype != input_tensor.dtype
+        or residual.device != input_tensor.device
+        or weight.dim() != 1
+        or weight.numel() != input_tensor.shape[-1]
+        or weight.dtype != input_tensor.dtype
+        or weight.device != input_tensor.device
+    ):
+        return None, None, None
+    if (
+        not input_tensor.is_contiguous()
+        or not residual.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        return None, None, None
+    if (
+        scale_factor is None
+        or scale_factor.numel() != 1
+        or not scale_factor.is_cuda
+        or scale_factor.device != input_tensor.device
+        or scale_factor.dtype != torch.float32
+    ):
+        return None, None, None
+    if input_tensor.shape[0] > max_token_num:
+        return None, None, None
+
+    if not ensure_workspace_initialized(
+        max_token_num=max_token_num,
+        hidden_dim=input_tensor.shape[-1],
+        use_fp32_lamport=(input_tensor.dtype == torch.float32),
+        dtype=input_tensor.dtype,
+        token_num=input_tensor.shape[0],
+        use_oneshot=use_oneshot,
+        use_attn_tp_group=use_attn_tp_group,
+    ):
+        return None, None, None
+
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+    if workspace_manager.workspace is None:
+        return None, None, None
+
+    return _flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op(
+        input_tensor=input_tensor,
+        residual=residual,
+        weight=weight,
+        scale_factor=scale_factor,
+        eps=eps,
+        max_token_num=max_token_num,
+        use_oneshot=use_oneshot,
+        trigger_completion_at_end=trigger_completion_at_end,
+        fp32_acc=fp32_acc,
+        use_attn_tp_group=use_attn_tp_group,
+        keep_bf16=keep_bf16,
+    )
+
+
 def can_use_flashinfer_allreduce(
     input_: torch.Tensor,
     *,
