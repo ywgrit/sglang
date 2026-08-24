@@ -2,7 +2,7 @@ import contextlib
 import inspect
 import types
 import unittest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -264,8 +264,26 @@ class TestFlashInferAllReduceQuantCapability(CustomTestCase):
                     all_reduce.assert_not_called()
 
     def test_pre_initialize_syncs_both_capabilities_before_early_return(self):
-        for comm, unavailable in ((None, False), (_FakeFlashInferComm(), True)):
-            synchronize = MagicMock()
+        cases = (
+            (None, False, False),
+            (_FakeFlashInferComm(), True, False),
+            (_FakeFlashInferComm(), False, True),
+        )
+        for comm, unavailable, expect_initialization in cases:
+            events = []
+            synchronize = MagicMock(
+                side_effect=lambda use_attn_tp_group: events.append(
+                    ("quant", use_attn_tp_group)
+                )
+            )
+            synchronize_unavailable = MagicMock(
+                side_effect=lambda: events.append(("unavailable",))
+            )
+            initialize = MagicMock(
+                side_effect=lambda **kwargs: events.append(
+                    ("initialize", kwargs["use_attn_tp_group"])
+                )
+            )
             with (
                 self.subTest(comm=comm, unavailable=unavailable),
                 patch.object(fusion, "_flashinfer_comm", comm),
@@ -278,7 +296,14 @@ class TestFlashInferAllReduceQuantCapability(CustomTestCase):
                     synchronize,
                     create=True,
                 ),
-                patch.object(fusion, "ensure_workspace_initialized") as initialize,
+                patch.object(
+                    fusion,
+                    "_sync_allreduce_unavailable_across_tp",
+                    synchronize_unavailable,
+                ),
+                patch.object(
+                    fusion, "ensure_workspace_initialized", initialize
+                ),
             ):
                 fusion.pre_initialize_workspaces(
                     max_token_num=8,
@@ -286,8 +311,18 @@ class TestFlashInferAllReduceQuantCapability(CustomTestCase):
                     dtype=torch.bfloat16,
                 )
 
-            self.assertEqual(synchronize.call_args_list, [call(False), call(True)])
-            initialize.assert_not_called()
+            self.assertEqual(
+                events,
+                [("quant", False), ("quant", True), ("unavailable",)]
+                + (
+                    [("initialize", False), ("initialize", True)]
+                    if expect_initialization
+                    else []
+                ),
+            )
+            synchronize_unavailable.assert_called_once_with()
+            if not expect_initialization:
+                initialize.assert_not_called()
 
     def test_hybrid_ep_failure_is_voted_across_enclosing_tp(self):
         tp_cpu_group = object()

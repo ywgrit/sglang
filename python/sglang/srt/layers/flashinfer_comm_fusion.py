@@ -1060,6 +1060,7 @@ def pre_initialize_workspaces(
     """
     _synchronize_allreduce_quant_capability(False)
     _synchronize_allreduce_quant_capability(True)
+    _sync_allreduce_unavailable_across_tp()
 
     if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
         return
