@@ -143,6 +143,14 @@ The required signature set is:
 
 `scale_out` is not required for static per-tensor quantization.
 
+Add a mocked two-rank/exact-group test for a future startup helper
+`_synchronize_allreduce_quant_capability`: local rank 0 reports the new API and
+local rank 1 does not. The mocked CPU-group `all_reduce(MAX)` must cache false
+on both ranks, and subsequent preflight must choose ordinary fusion without a
+hot-path CPU collective. Also assert that attention TP, MoE TP, and EP paths
+pass their own coordinator's `cpu_group`, never unconditional
+`get_tp_group().cpu_group`.
+
 **Step 3: Run the focused tests and observe RED**
 
 Run:
@@ -173,6 +181,7 @@ Add:
 
 ```python
 _flashinfer_allreduce_quant_available = False
+_flashinfer_allreduce_quant_capability_by_group = {}
 
 
 def _supports_allreduce_rmsnorm_static_fp8_quant(comm) -> bool:
@@ -195,6 +204,70 @@ def _supports_allreduce_rmsnorm_static_fp8_quant(comm) -> bool:
 def is_flashinfer_allreduce_quant_available() -> bool:
     return _flashinfer_allreduce_quant_available
 ```
+
+Add a group-aware startup synchronization helper. Factor exact group
+selection into `_get_allreduce_group(use_attn_tp_group)` so it returns
+`(world_size, rank, coordinator)` for attention TP, EP, or MoE TP using the
+same rules as `ensure_workspace_initialized`:
+
+```python
+def _synchronize_allreduce_quant_capability(
+    use_attn_tp_group: bool,
+) -> bool:
+    world_size, _, coordinator = _get_allreduce_group(use_attn_tp_group)
+    if world_size <= 1:
+        return False
+    key = coordinator.cpu_group
+    unavailable = torch.tensor(
+        [0 if _flashinfer_allreduce_quant_available else 1],
+        dtype=torch.int32,
+    )
+    dist.all_reduce(
+        unavailable,
+        op=dist.ReduceOp.MAX,
+        group=coordinator.cpu_group,
+    )
+    available = unavailable.item() == 0
+    _flashinfer_allreduce_quant_capability_by_group[key] = available
+    return available
+
+
+def _is_allreduce_quant_capability_available_for_group(
+    use_attn_tp_group: bool,
+) -> bool:
+    world_size, _, coordinator = _get_allreduce_group(use_attn_tp_group)
+    if world_size <= 1:
+        return False
+    # Fail closed if startup synchronization has not happened.
+    return _flashinfer_allreduce_quant_capability_by_group.get(
+        coordinator.cpu_group, False
+    )
+```
+
+The cache is per exact CPU process group. Do not mutate the process-global local
+probe based on one subgroup, because a rank may participate in multiple groups.
+Every rank registers the consumer without consulting this flag.
+
+At the very start of `pre_initialize_workspaces`, before its existing
+`_flashinfer_allreduce_unavailable or _flashinfer_comm is None` early return,
+call startup synchronization for the MoE and attention groups:
+
+```python
+_synchronize_allreduce_quant_capability(use_attn_tp_group=False)
+_synchronize_allreduce_quant_capability(use_attn_tp_group=True)
+```
+
+`BaseRunner._pre_initialize_flashinfer_allreduce_workspace` already invokes
+this function during warmup on all ranks before CUDA Graph capture. Keep that
+call site unchanged, but add a test proving capability sync occurs before the
+early return even when the local `_flashinfer_comm` is absent. This avoids any
+CPU collective in layer forward or graph replay.
+
+Refactor `_sync_allreduce_unavailable_across_tp` to accept
+`use_attn_tp_group`, select the same exact coordinator, and sync on its
+`cpu_group`; update `ensure_workspace_initialized` to pass the argument. This
+keeps workspace failure fallback rank-invariant for attention TP, EP, and MoE
+TP rather than always syncing the global TP group.
 
 **Step 2: Set the flag during the existing import probe**
 
@@ -251,15 +324,16 @@ Add one parameterized/subtest loop over `keep_bf16=False, True`. Patch:
 
 - `_flashinfer_comm` to the fake.
 - `_flashinfer_allreduce_quant_available=True`.
+- `_flashinfer_allreduce_quant_capability_by_group` so the exact selected group is cached as available (capability synchronization itself is tested separately).
 - workspace manager to an initialized fake workspace.
 - `ensure_workspace_initialized=True` if needed to isolate the wrapper.
 - `get_parallel()` world sizes so the selected MoE TP group has `world_size=4`.
 
-Call the future wrapper:
+Call the future public preflight wrapper:
 
 ```python
 quant_out, residual_out, norm_out = (
-    fusion.flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+    fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
         input_tensor,
         residual,
         gemma_weight,
@@ -286,7 +360,7 @@ Assert:
 
 Test that the wrapper returns `(None, None, None)` without invoking the fake collective for each of:
 
-- quant capability false;
+- one rank's quant capability false (all peers fall back via exact CPU group);
 - scalar scale absent or `numel() != 1`;
 - non-contiguous input/residual/weight;
 - world size one;
@@ -311,7 +385,7 @@ git add test/registered/unit/layers/test_flashinfer_comm_fusion.py
 git commit -m "test: cover FlashInfer fused allreduce FP8 patterns"
 ```
 
-### Task 5: Implement the tensor-only custom-op wrapper
+### Task 5: Implement Python preflight plus a tensor-only custom op
 
 **Files:**
 - Modify: `python/sglang/srt/layers/flashinfer_comm_fusion.py:760-870`
@@ -319,7 +393,7 @@ git commit -m "test: cover FlashInfer fused allreduce FP8 patterns"
 **Step 1: Add a FakeTensor implementation**
 
 ```python
-def fake_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+def fake_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -342,12 +416,23 @@ def fake_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
     return quant_out, residual_out, norm_out
 ```
 
-**Step 2: Add the real wrapper**
+**Step 2: Add the private real custom op**
 
-Register it as a custom op. Its pre-launch checks mirror `flashinfer_allreduce_residual_rmsnorm`, with these additions:
+Register `_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op` as the
+custom op. Its annotated and actual return is always exactly three tensors.
+It assumes public preflight has already established capability, tensor
+eligibility, exact-group workspace readiness, and scalar scale readiness. It
+asserts the workspace is present, allocates outputs, launches FlashInfer once,
+and returns the three tensors. It must never return `None`.
+
+**Step 3: Add the public Python preflight wrapper**
+
+Add an unregistered Python function
+`try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant`. Its pre-launch
+checks mirror `flashinfer_allreduce_residual_rmsnorm`, with these additions:
 
 ```python
-if not _flashinfer_allreduce_quant_available:
+if not _is_allreduce_quant_capability_available_for_group(use_attn_tp_group):
     return None, None, None
 if scale_factor is None or scale_factor.numel() != 1:
     return None, None, None
@@ -355,7 +440,13 @@ if scale_factor.device != input_tensor.device:
     return None, None, None
 ```
 
-After workspace validation allocate the three outputs as in the fake. Select:
+It performs all rank-invariant shape/dtype/contiguity checks, calls
+`ensure_workspace_initialized`, then invokes the private custom op. Fallback is
+legal only here, before the private op/collective is entered. This split is
+required because the registered op schema cannot declare Tensor outputs and
+then return `(None, None, None)`.
+
+Inside the private op, allocate outputs as in the fake. Select:
 
 ```python
 pattern = (
@@ -365,7 +456,7 @@ pattern = (
 )
 ```
 
-Call the unified API once:
+Call the unified API once inside the private op:
 
 ```python
 kwargs = dict(
@@ -395,7 +486,7 @@ Match the existing wrapper's exact argument names for `use_oneshot`/`fp32_acc`; 
 
 Do not wrap this call in `try/except`.
 
-**Step 3: Run GREEN plus the existing suite**
+**Step 4: Run GREEN plus the existing suite**
 
 ```bash
 PYTHONPATH=python python -m pytest -q \
@@ -404,7 +495,7 @@ PYTHONPATH=python python -m pytest -q \
 
 Expected: all tests in the file pass on the configured one-GPU test environment; no old backend/workspace test regresses.
 
-**Step 4: Commit**
+**Step 5: Commit**
 
 ```bash
 git add python/sglang/srt/layers/flashinfer_comm_fusion.py
@@ -460,10 +551,13 @@ Expected: failure because `ModelOptFp8LinearMethod.apply` treats the tuple as a 
 
 **Step 3: Implement tuple consumption before all ModelOpt special paths**
 
-At the top of `ModelOptFp8LinearMethod.apply`, before Marlin, SM120 GEMV, and FlashInfer BMM dispatch:
+At the top of `ModelOptFp8LinearMethod.apply`, handle tuple input with an
+explicit Marlin rejection before SM120 GEMV and FlashInfer BMM dispatch:
 
 ```python
 if isinstance(x, tuple):
+    if self.use_marlin:
+        raise TypeError("ModelOpt FP8 Marlin cannot consume pre-quantized input")
     qx, x_scale = x[0], x[1]
     out_dtype = x[2] if len(x) > 2 else None
     return apply_fp8_linear(
@@ -477,7 +571,7 @@ if isinstance(x, tuple):
     )
 ```
 
-This deliberately bypasses `apply_fp8_linear_bmm_flashinfer`, whose current implementation begins by calling `static_quant_fp8` on a BF16 tensor. It also bypasses the SM120 GEMV branch, which likewise quantizes internally. Benchmark this dispatch choice later; correctness and removal of the standalone quant kernel come first.
+This deliberately bypasses `apply_fp8_linear_bmm_flashinfer`, whose current implementation begins by calling `static_quant_fp8` on a BF16 tensor. It also bypasses the SM120 GEMV branch, which likewise quantizes internally. Marlin must raise before this branch uses its rearranged weight, and is never registered as an eligible producer consumer. Benchmark the non-Marlin dispatch choice later; correctness and removal of the standalone quant kernel come first.
 
 Validate that `apply_fp8_linear` accepts `pre_quant_output_dtype` on the pinned SGLang base before committing.
 
@@ -549,7 +643,7 @@ permanently disable the target path.
 
 **Step 2: Test the quant-only contract**
 
-Patch `flashinfer_allreduce_residual_rmsnorm_static_fp8_quant` to return known tensors. Call the future method:
+Patch `try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant` to return known tensors. Call the future method:
 
 ```python
 result = norm.forward_with_allreduce_fusion_static_fp8_quant(
@@ -618,10 +712,10 @@ def _forward_with_allreduce_fusion_static_fp8_quant(
     if scale is None:
         return None
     from sglang.srt.layers.flashinfer_comm_fusion import (
-        flashinfer_allreduce_residual_rmsnorm_static_fp8_quant,
+        try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant,
     )
     quant_out, residual_out, norm_out = (
-        flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+        try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
             input_tensor=x,
             residual=residual,
             weight=weight,
@@ -849,11 +943,16 @@ def _fused_ar_quant_disabled() -> bool:
 Keep `_enable_qwen35_fused_ar_quant()` as the AMD decision if renaming it would cause unnecessary churn. Add a CUDA decision that requires:
 
 - `_is_cuda` and not `_use_aiter`;
-- FlashInfer quant capability;
 - static-FP8 tuple consumer capability on the exact quant method, without checking scale cardinality;
 - ordinary FlashInfer allreduce fusion configuration remains enabled by its existing runtime gate.
 
-Capability is an optimization gate only; do not initialize a workspace or enter a collective in the model constructor. The LayerNorm helper calls `_fp8_static_input_scale` at forward time, after `process_weights_after_loading`, and returns `None` if the scale is absent/non-scalar so the communicator takes ordinary AR+RMSNorm.
+Do not consult the process-local FlashInfer import/API capability in the model
+constructor: asymmetric local decisions would make ranks choose different
+collectives. Startup synchronizes capability per exact group; public preflight
+reads that cache. Do not initialize a workspace or enter a collective in the
+model constructor. The LayerNorm helper calls `_fp8_static_input_scale` at
+forward time, after `process_weights_after_loading`, and returns `None` if the
+scale is absent/non-scalar so the communicator takes ordinary AR+RMSNorm.
 
 **Step 2: Split tuple selectors**
 
@@ -907,7 +1006,12 @@ dataclass/NamedTuple into the graph boundary in this PR.
 
 **Step 3: Add CUDA GDN handler**
 
-Rename `_forward_input_proj_fused_quant_amd` to a backend-neutral routine or add a CUDA sibling. Preserve BF16 for `in_proj_ba` and retain current alternate-stream behavior.
+Rename `_forward_input_proj_fused_quant_amd` to
+`_forward_input_proj_fused_quant`. It first selects `hs_bf16 =
+hidden_states[0]`, then obtains `hs_qkvz` through the consumer-aware selector.
+Preserve BF16 for `in_proj_ba` and retain current alternate-stream behavior.
+Change `_forward_input_proj` to call this routine for tuple input on either AMD
+or CUDA, rather than guarding it with `_use_aiter`.
 
 **Step 4: Register consumers in both decoder layer types**
 
@@ -922,7 +1026,25 @@ Pass the exact projection into `LayerCommunicator`.
 
 **Step 5: Remove CUDA tuple guards tied to `_use_aiter`**
 
-At every full-attention projection preparation path, select a tuple whenever `hidden_states` is a tuple, using the backend-aware selector. Verify all CUDA preparation variants (`native`, `fused_gate`, and any fused QK/RoPE path) either consume the tuple or deliberately fall back before it is produced.
+At every full-attention projection preparation path, select a tuple whenever
+`hidden_states` is a tuple, using the backend-aware selector. In particular,
+`forward_prepare_cuda_fused` must begin with:
+
+```python
+projection_input = _select_fused_ar_input_for_linear(
+    hidden_states, self.qkv_proj
+)
+qkv, _ = self.qkv_proj(projection_input)
+```
+
+After projection, derive token count from a tensor output (`qkv.shape[0]` or
+`q_out.shape[0]`), never `hidden_states.shape[0]`, because the fused input may
+be a tuple. Make the same selection in `native` and `fused_gate` paths.
+
+Add an `attn_output_gate=True` CUDA-fused-path regression test that passes the
+static three-tuple, verifies `qkv_proj` receives it, and proves no tuple
+`.shape` access occurs. Verify every other QKV preparation variant either
+consumes the tuple or deliberately falls back before it is produced.
 
 **Step 6: Run GREEN plus relevant existing tests**
 
