@@ -36,6 +36,11 @@ CASE_NAMES = (
 )
 MAX_BASELINE_SATURATION_RATE = 0.01
 MAX_FP8_ULPS = 2
+GPU_FABRIC_QUERY = (
+    "nvidia-smi",
+    "--query-gpu=index,uuid,fabric.state,fabric.status",
+    "--format=csv,noheader",
+)
 
 METADATA_FIELDS = (
     "timestamp_utc",
@@ -857,7 +862,7 @@ def _metadata(runtime, args, resolved_backend, world_size, device, repo_root):
         ),
         "nccl_version": _nccl_version(runtime.torch),
         "nvlink_status": _run_readonly(("nvidia-smi", "nvlink", "--status")),
-        "gpu_fabric": _run_readonly(("nvidia-smi", "-q", "-d", "FABRIC")),
+        "gpu_fabric": _run_readonly(GPU_FABRIC_QUERY),
         "torch_version": runtime.torch.__version__,
         "torch_git_version": getattr(runtime.torch.version, "git_version", None),
         "cuda_version": runtime.torch.version.cuda,
