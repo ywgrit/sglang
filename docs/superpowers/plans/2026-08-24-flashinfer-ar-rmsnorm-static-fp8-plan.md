@@ -841,32 +841,53 @@ Capability is an optimization gate only; do not initialize a workspace or enter 
 
 **Step 2: Split tuple selectors**
 
-Implement explicit selection:
+Implement one explicit selector whose interpretation is anchored by the exact
+consumer quant method, not tuple length alone:
 
 ```python
 def _select_fused_ar_input_for_linear(hidden_states, linear):
     if not isinstance(hidden_states, tuple):
         return hidden_states
+
+    accepts_static = _linear_accepts_static_fp8_tuple(linear)
+    accepts_group = _linear_accepts_group_fp8_tuple(linear)
+
+    # CUDA quant-only contract: (fp8, scalar_scale, orig_dtype).
+    if accepts_static and len(hidden_states) == 3 and isinstance(
+        hidden_states[2], torch.dtype
+    ):
+        return hidden_states
+
+    # AMD quant-only contract: (fp8, group_scale).
+    if accepts_group and len(hidden_states) == 2:
+        return hidden_states
+
+    # CUDA GDN dual-output contract.
     if len(hidden_states) == 4:
         hs_bf16, hs_fp8, hs_scale, orig_dtype = hidden_states
-        if _linear_accepts_static_fp8_tuple(linear):
+        if accepts_static:
             return hs_fp8, hs_scale, orig_dtype
         return hs_bf16
+
+    # AMD GDN dual-output contract.
     if len(hidden_states) == 3:
         hs_bf16, hs_fp8, hs_scale = hidden_states
-        if _linear_accepts_group_fp8_tuple(linear):
+        if accepts_group:
             return hs_fp8, hs_scale
         return hs_bf16
-    if len(hidden_states) in (2, 3) and ...:
-        ...
+
+    raise TypeError(
+        f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
+    )
 ```
 
-Resolve the ambiguity that both AMD dual-output and CUDA quant-only can have length 3 by routing at the call site with backend-specific helpers, or by introducing a small named dataclass/NamedTuple if PyTorch graph capture accepts it. The simplest safe contract is:
+This resolves the only length ambiguity: both AMD dual-output and CUDA
+quant-only have length 3, but the CUDA tuple's last entry is a `torch.dtype`
+and its consumer is a static per-tensor method, while the AMD tuple's last entry
+is a scale tensor and its consumer is block/MXFP8.
 
-- GDN handler knows dual-output tuple by backend (`_use_aiter`: len 3; CUDA: len 4).
-- full-attention receives AMD len 2 or CUDA len 3 and chooses using the exact consumer's quant method.
-
-Do not use tuple length alone to distinguish AMD GDN from CUDA quant-only.
+Unit-test all four contracts and the TypeError branch. Do not introduce a
+dataclass/NamedTuple into the graph boundary in this PR.
 
 **Step 3: Add CUDA GDN handler**
 
