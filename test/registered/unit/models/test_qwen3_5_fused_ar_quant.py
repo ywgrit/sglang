@@ -9,6 +9,7 @@ linear layer.
 
 import os
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -47,6 +48,44 @@ class _Linear(torch.nn.Module):
     def forward(self, hidden_states):
         self.inputs.append(hidden_states)
         return self.output, None
+
+
+class _TensorConsumer(torch.nn.Module):
+    def __init__(self, output):
+        super().__init__()
+        self.output = output
+        self.inputs = []
+
+    def forward(self, hidden_states, *args, **kwargs):
+        self.inputs.append(hidden_states)
+        return self.output
+
+
+class _CommunicatorProbe:
+    def __init__(self, fused_hidden_states, residual):
+        self.fused_hidden_states = fused_hidden_states
+        self.residual = residual
+
+    def prepare_attn_and_capture_last_layer_outputs(self, *args, **kwargs):
+        return self.fused_hidden_states, self.residual
+
+    def prepare_mlp(self, hidden_states, residual, forward_batch):
+        return hidden_states, residual
+
+    def should_use_reduce_scatter(self, forward_batch):
+        return False
+
+    def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
+        return False
+
+    def postprocess_layer(self, hidden_states, residual, forward_batch):
+        return hidden_states, residual
+
+
+class _ShapeForbiddenTensor(torch.Tensor):
+    @property
+    def shape(self):
+        raise AssertionError("decoder token count inspected a non-leading tensor")
 
 
 def _native_fp8_method(*, block=False, mxfp8=False, marlin=False):
@@ -300,6 +339,108 @@ class TestQwen35GdnFusedArRouting(unittest.TestCase):
         self.assertIs(qkv.inputs[0][0], fp8)
         self.assertIs(qkv.inputs[0][1], scale)
         self.assertIs(ba.inputs[0], bf16)
+
+    def test_gdn_rejects_quant_only_tuples_before_ba_projection(self):
+        fp8 = torch.empty(2, 4, dtype=torch.float8_e4m3fn)
+        scalar_scale = torch.tensor([0.125])
+        group_scale = torch.ones(2, 1)
+        cases = [
+            (
+                "AMD quant-only",
+                (fp8, group_scale),
+                _group_linear(block=True),
+                "amd",
+                True,
+            ),
+            (
+                "CUDA quant-only",
+                (fp8, scalar_scale, torch.bfloat16),
+                _static_linear(),
+                "cuda",
+                False,
+            ),
+        ]
+
+        for name, fused, qkv, backend, use_aiter in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(TypeError, r"GDN.*dual-output"):
+                    self._run_input_projection(
+                        fused,
+                        qkv,
+                        backend=backend,
+                        use_aiter=use_aiter,
+                    )
+
+
+class TestQwen35DecoderFusedArTokenCount(unittest.TestCase):
+    def setUp(self):
+        self.forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False)
+        )
+        self.residual = torch.randn(2, 4)
+        self.attn_output = torch.randn(2, 4)
+        self.mlp_output = torch.randn(2, 4)
+
+    def _finish_fake_layer(self, layer, fused, attention_attr):
+        layer.layer_communicator = _CommunicatorProbe(fused, self.residual)
+        attention = _TensorConsumer(self.attn_output)
+        # ``self_attention`` is also a class method, so bypass Module's child
+        # registration to install the per-instance probe for this forward test.
+        object.__setattr__(layer, attention_attr, attention)
+        layer.mlp = _TensorConsumer(self.mlp_output)
+        return attention
+
+    def test_gdn_decoder_uses_bf16_side_output_for_tuple_token_count(self):
+        bf16 = torch.randn(2, 4, dtype=torch.bfloat16)
+        fp8 = torch.empty(2, 4, dtype=torch.float8_e4m3fn).as_subclass(
+            _ShapeForbiddenTensor
+        )
+        scale = torch.tensor([0.125]).as_subclass(_ShapeForbiddenTensor)
+        fused = (bf16, fp8, scale, torch.bfloat16)
+        layer = qwen35.Qwen3_5LinearDecoderLayer.__new__(
+            qwen35.Qwen3_5LinearDecoderLayer
+        )
+        torch.nn.Module.__init__(layer)
+        linear_attn = self._finish_fake_layer(layer, fused, "linear_attn")
+
+        with mock.patch.object(
+            qwen35,
+            "get_forward",
+            return_value=SimpleNamespace(scoped=lambda **kwargs: nullcontext()),
+        ):
+            output, _ = layer(
+                torch.randn(2, 4),
+                self.residual,
+                forward_batch=self.forward_batch,
+            )
+
+        self.assertIs(linear_attn.inputs[0], fused)
+        self.assertIs(output, self.mlp_output)
+
+    def test_full_attention_decoder_uses_fp8_tensor_for_tuple_token_count(self):
+        fp8 = torch.empty(2, 4, dtype=torch.float8_e4m3fn)
+        scale = torch.tensor([0.125]).as_subclass(_ShapeForbiddenTensor)
+        fused = (fp8, scale, torch.bfloat16)
+        layer = qwen35.Qwen3_5AttentionDecoderLayer.__new__(
+            qwen35.Qwen3_5AttentionDecoderLayer
+        )
+        torch.nn.Module.__init__(layer)
+        self_attention = self._finish_fake_layer(layer, fused, "self_attention")
+
+        with mock.patch.object(
+            qwen35,
+            "get_forward",
+            return_value=SimpleNamespace(scoped=lambda **kwargs: nullcontext()),
+        ):
+            output, _ = layer(
+                positions=torch.arange(2),
+                hidden_states=torch.randn(2, 4),
+                residual=self.residual,
+                forward_batch=self.forward_batch,
+            )
+
+        self.assertIs(self_attention.inputs[0], fused)
+        self.assertIs(output, self.mlp_output)
 
 
 class TestQwen35FullAttentionFusedArRouting(unittest.TestCase):
