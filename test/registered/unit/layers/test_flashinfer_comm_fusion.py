@@ -42,6 +42,20 @@ class _FakeFlashInferComm:
             kwargs["backend"], kwargs["world_size"], dtype=kwargs["dtype"]
         )
 
+    @staticmethod
+    def _residual_rmsnorm(input, workspace, residual_in, rms_gamma, rms_eps):
+        allreduced = input * workspace.world_size
+        residual_out = allreduced + residual_in
+        variance = residual_out.to(torch.float32).pow(2).mean(
+            dim=-1, keepdim=True
+        )
+        norm_fp32 = (
+            residual_out.to(torch.float32)
+            * torch.rsqrt(variance + rms_eps)
+            * rms_gamma.to(torch.float32)
+        )
+        return residual_out, norm_fp32
+
     def allreduce_fusion(
         self,
         *,
@@ -67,19 +81,50 @@ class _FakeFlashInferComm:
             output.copy_(allreduced)
             return output
 
-        if pattern is not self.AllReduceFusionPattern.kARResidualRMSNorm:
+        rmsnorm_patterns = (
+            self.AllReduceFusionPattern.kARResidualRMSNorm,
+            self.AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
+            self.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
+        )
+        if pattern not in rmsnorm_patterns:
             raise ValueError(f"Unexpected pattern: {pattern}")
 
-        allreduced = input * workspace.world_size
-        expected_residual = allreduced + residual_in
-        variance = expected_residual.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
-        expected_norm = (
-            expected_residual.to(torch.float32)
-            * torch.rsqrt(variance + rms_eps)
-            * rms_gamma.to(torch.float32)
-        ).to(input.dtype)
+        expected_residual, norm_fp32 = self._residual_rmsnorm(
+            input,
+            workspace,
+            residual_in,
+            rms_gamma,
+            rms_eps,
+        )
+        expected_norm = norm_fp32.to(input.dtype)
         residual_out.copy_(expected_residual)
-        norm_out.copy_(expected_norm)
+
+        if pattern is self.AllReduceFusionPattern.kARResidualRMSNorm:
+            norm_out.copy_(expected_norm)
+            return norm_out
+
+        assert weight_bias == 0.0
+        quantized = torch.clamp(
+            norm_fp32 / scale_factor.to(torch.float32),
+            min=torch.finfo(torch.float8_e4m3fn).min,
+            max=torch.finfo(torch.float8_e4m3fn).max,
+        ).to(torch.float8_e4m3fn)
+        quant_out.copy_(quantized)
+        if (
+            pattern
+            is self.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant
+        ):
+            norm_out.copy_(expected_norm)
+        self.calls.append(
+            {
+                "pattern": pattern,
+                "scale_factor": scale_factor,
+                "weight_bias": weight_bias,
+                "rms_gamma": rms_gamma,
+                "norm_out": norm_out,
+            }
+        )
+        return quant_out
 
 
 class TestFlashInferAllReduceQuantCapability(CustomTestCase):
@@ -441,18 +486,255 @@ class TestFlashInferAllReduceQuantCapability(CustomTestCase):
                 )
 
 
+def _torch_rmsnorm_fp32(residual_out, weight, eps):
+    variance = residual_out.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+    return (
+        residual_out.to(torch.float32)
+        * torch.rsqrt(variance + eps)
+        * weight.to(torch.float32)
+    )
+
+
 def _torch_allreduce_residual_rmsnorm_baseline(
     input_tensor, residual, weight, world_size, eps
 ):
     allreduced = input_tensor * world_size
     residual_out = allreduced + residual
-    variance = residual_out.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
-    norm_out = (
-        residual_out.to(torch.float32)
-        * torch.rsqrt(variance + eps)
-        * weight.to(torch.float32)
-    ).to(input_tensor.dtype)
+    norm_out = _torch_rmsnorm_fp32(residual_out, weight, eps).to(
+        input_tensor.dtype
+    )
     return norm_out, residual_out
+
+
+def _torch_static_fp8_quant(tensor_fp32, scale_factor):
+    return torch.clamp(
+        tensor_fp32 / scale_factor.to(torch.float32),
+        min=torch.finfo(torch.float8_e4m3fn).min,
+        max=torch.finfo(torch.float8_e4m3fn).max,
+    ).to(torch.float8_e4m3fn)
+
+
+class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
+    @contextlib.contextmanager
+    def _patched_quant_path(
+        self,
+        fake_comm,
+        *,
+        world_size=4,
+        capability_available=True,
+        workspace_available=True,
+    ):
+        cpu_group = object()
+        coordinator = types.SimpleNamespace(
+            world_size=world_size,
+            rank_in_group=0,
+            cpu_group=cpu_group,
+            device_group=object(),
+        )
+        workspace = _FakeWorkspace("trtllm", world_size)
+        manager = types.SimpleNamespace(
+            workspace=workspace,
+            initialized=True,
+            world_size=world_size,
+        )
+        parallel = types.SimpleNamespace(
+            attn_tp_size=world_size,
+            attn_tp_rank=0,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_tp_size=world_size,
+            moe_tp_rank=0,
+        )
+        capability_cache = (
+            {cpu_group: capability_available} if world_size > 1 else {}
+        )
+        with (
+            patch.object(fusion, "_flashinfer_comm", fake_comm),
+            patch.object(fusion, "_flashinfer_allreduce_unavailable", False),
+            patch.object(
+                fusion, "_flashinfer_allreduce_quant_available", True
+            ),
+            patch.object(
+                fusion,
+                "_flashinfer_allreduce_quant_capability_by_group",
+                capability_cache,
+            ),
+            patch.object(fusion, "is_flashinfer_available", return_value=True),
+            patch.object(fusion, "get_parallel", return_value=parallel),
+            patch.object(fusion, "get_moe_tp_group", return_value=coordinator),
+            patch.object(
+                fusion,
+                "ensure_workspace_initialized",
+                return_value=workspace_available,
+            ),
+            patch.object(fusion, "_get_workspace_manager", return_value=manager),
+        ):
+            yield coordinator, manager
+
+    def _inputs(self):
+        torch.manual_seed(7)
+        device = torch.device("cuda")
+        return (
+            torch.randn(3, 8, dtype=torch.bfloat16, device=device),
+            torch.randn(3, 8, dtype=torch.bfloat16, device=device),
+            # This represents Gemma's already-adjusted weight. The fused call
+            # must use it directly with weight_bias=0, never add one again.
+            torch.randn(8, dtype=torch.bfloat16, device=device) + 1,
+            torch.tensor(0.03125, dtype=torch.float32, device=device),
+        )
+
+    def test_static_fp8_quant_patterns_match_rmsnorm_baseline(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for FlashInfer FP8 fusion contract")
+
+        world_size = 4
+        eps = 1e-6
+        for keep_bf16 in (False, True):
+            with self.subTest(keep_bf16=keep_bf16):
+                input_tensor, residual, gemma_weight, input_scale = self._inputs()
+                fake_comm = _FakeFlashInferComm()
+                with self._patched_quant_path(fake_comm, world_size=world_size):
+                    quant_out, residual_out, norm_out = (
+                        fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+                            input_tensor=input_tensor,
+                            residual=residual,
+                            weight=gemma_weight,
+                            scale_factor=input_scale,
+                            eps=eps,
+                            use_attn_tp_group=False,
+                            keep_bf16=keep_bf16,
+                        )
+                    )
+
+                expected_norm, expected_residual = (
+                    _torch_allreduce_residual_rmsnorm_baseline(
+                        input_tensor,
+                        residual,
+                        gemma_weight,
+                        world_size,
+                        eps,
+                    )
+                )
+                expected_quant = _torch_static_fp8_quant(
+                    _torch_rmsnorm_fp32(
+                        expected_residual, gemma_weight, eps
+                    ),
+                    input_scale,
+                )
+
+                self.assertEqual(quant_out.dtype, torch.float8_e4m3fn)
+                torch.testing.assert_close(residual_out, expected_residual)
+                torch.testing.assert_close(
+                    quant_out.to(torch.float32),
+                    expected_quant.to(torch.float32),
+                    rtol=0,
+                    atol=0,
+                )
+                if keep_bf16:
+                    self.assertEqual(norm_out.dtype, torch.bfloat16)
+                    torch.testing.assert_close(norm_out, expected_norm)
+                else:
+                    self.assertEqual(norm_out.numel(), 0)
+
+                self.assertEqual(len(fake_comm.calls), 1)
+                call = fake_comm.calls[0]
+                expected_pattern = (
+                    fake_comm.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant
+                    if keep_bf16
+                    else fake_comm.AllReduceFusionPattern.kARResidualRMSNormFP8Quant
+                )
+                self.assertIs(call["pattern"], expected_pattern)
+                self.assertIs(call["scale_factor"], input_scale)
+                self.assertIs(call["rms_gamma"], gemma_weight)
+                self.assertEqual(call["weight_bias"], 0.0)
+                if keep_bf16:
+                    self.assertIs(call["norm_out"], norm_out)
+                else:
+                    self.assertIsNone(call["norm_out"])
+
+    def test_static_fp8_quant_fallbacks_happen_before_collective(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for FlashInfer FP8 fusion contract")
+
+        input_tensor, residual, weight, scale = self._inputs()
+        noncontiguous_input = torch.randn(
+            8, 3, dtype=input_tensor.dtype, device=input_tensor.device
+        ).t()
+        noncontiguous_residual = torch.randn(
+            8, 3, dtype=residual.dtype, device=residual.device
+        ).t()
+        noncontiguous_weight = torch.randn(
+            16, dtype=weight.dtype, device=weight.device
+        )[::2]
+        cases = (
+            ("group_capability_unavailable", {}, {"capability_available": False}),
+            ("scale_absent", {"scale_factor": None}, {}),
+            (
+                "scale_not_scalar",
+                {"scale_factor": torch.ones(2, device=scale.device)},
+                {},
+            ),
+            (
+                "scale_wrong_device",
+                {"scale_factor": torch.tensor(scale.item(), device="cpu")},
+                {},
+            ),
+            ("input_noncontiguous", {"input_tensor": noncontiguous_input}, {}),
+            ("residual_noncontiguous", {"residual": noncontiguous_residual}, {}),
+            ("weight_noncontiguous", {"weight": noncontiguous_weight}, {}),
+            ("single_rank", {}, {"world_size": 1}),
+            (
+                "workspace_unavailable",
+                {},
+                {"workspace_available": False},
+            ),
+        )
+        for name, argument_overrides, path_overrides in cases:
+            fake_comm = _FakeFlashInferComm()
+            arguments = {
+                "input_tensor": input_tensor,
+                "residual": residual,
+                "weight": weight,
+                "scale_factor": scale,
+                "eps": 1e-6,
+                "use_attn_tp_group": False,
+                "keep_bf16": False,
+            }
+            arguments.update(argument_overrides)
+            with self.subTest(name=name), self._patched_quant_path(
+                fake_comm, **path_overrides
+            ):
+                result = (
+                    fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+                        **arguments
+                    )
+                )
+
+            self.assertEqual(result, (None, None, None))
+            self.assertEqual(fake_comm.calls, [])
+
+    def test_static_fp8_quant_collective_exception_propagates(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for FlashInfer FP8 fusion contract")
+
+        input_tensor, residual, weight, scale = self._inputs()
+        fake_comm = _FakeFlashInferComm()
+        fake_comm.allreduce_fusion = MagicMock(
+            side_effect=RuntimeError("collective launch failed")
+        )
+        with self._patched_quant_path(fake_comm):
+            with self.assertRaisesRegex(RuntimeError, "collective launch failed"):
+                fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+                    input_tensor=input_tensor,
+                    residual=residual,
+                    weight=weight,
+                    scale_factor=scale,
+                    eps=1e-6,
+                    use_attn_tp_group=False,
+                    keep_bf16=False,
+                )
+
+        fake_comm.allreduce_fusion.assert_called_once()
 
 
 class TestFlashInferCommFusion(CustomTestCase):
