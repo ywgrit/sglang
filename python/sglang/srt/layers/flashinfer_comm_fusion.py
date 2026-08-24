@@ -1044,6 +1044,7 @@ def _is_static_fp8_workspace_eligible(
     expected_world_size: int,
     expected_rank: int,
     expected_group_key: Tuple[Optional[ProcessGroup], Optional[ProcessGroup]],
+    expected_backend: Optional[str],
     expected_dtype: torch.dtype,
     token_num: int,
     hidden_dim: int,
@@ -1060,6 +1061,10 @@ def _is_static_fp8_workspace_eligible(
         and workspace_manager.world_size == expected_world_size
         and workspace_manager.rank == expected_rank
         and workspace_manager.group == expected_group_key
+        and expected_backend is not None
+        and workspace_manager.backend == expected_backend
+        and getattr(workspace_manager.workspace, "backend", None)
+        == expected_backend
         and workspace_manager.dtype == expected_dtype
         and workspace_manager.max_token_num is not None
         and workspace_manager.hidden_dim is not None
@@ -1134,6 +1139,9 @@ def try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
         return None, None, None
 
     expected_group_key = (coordinator.device_group, coordinator.cpu_group)
+    expected_backend = resolve_flashinfer_allreduce_fusion_backend(
+        get_server_args()
+    )
     if torch.compiler.is_compiling():
         workspace_manager = _get_workspace_manager(use_attn_tp_group)
         if not _is_static_fp8_workspace_eligible(
@@ -1141,6 +1149,7 @@ def try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
             expected_world_size=world_size,
             expected_rank=rank,
             expected_group_key=expected_group_key,
+            expected_backend=expected_backend,
             expected_dtype=input_tensor.dtype,
             token_num=input_tensor.shape[0],
             hidden_dim=input_tensor.shape[-1],
@@ -1177,6 +1186,7 @@ def try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
         expected_world_size=world_size,
         expected_rank=rank,
         expected_group_key=expected_group_key,
+        expected_backend=expected_backend,
         expected_dtype=input_tensor.dtype,
         token_num=input_tensor.shape[0],
         hidden_dim=input_tensor.shape[-1],
