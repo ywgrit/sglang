@@ -548,6 +548,7 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
         capability_cache = (
             {cpu_group: capability_available} if world_size > 1 else {}
         )
+        ensure_workspace = MagicMock(return_value=workspace_available)
         with (
             patch.object(fusion, "_flashinfer_comm", fake_comm),
             patch.object(fusion, "_flashinfer_allreduce_unavailable", False),
@@ -565,21 +566,40 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
             patch.object(
                 fusion,
                 "ensure_workspace_initialized",
-                return_value=workspace_available,
+                ensure_workspace,
             ),
             patch.object(fusion, "_get_workspace_manager", return_value=manager),
         ):
-            yield coordinator, manager
+            yield coordinator, manager, ensure_workspace
 
     def _inputs(self):
-        torch.manual_seed(7)
         device = torch.device("cuda")
+        generator = torch.Generator(device=device)
+        generator.manual_seed(7)
         return (
-            torch.randn(3, 8, dtype=torch.bfloat16, device=device),
-            torch.randn(3, 8, dtype=torch.bfloat16, device=device),
+            torch.randn(
+                3,
+                8,
+                dtype=torch.bfloat16,
+                device=device,
+                generator=generator,
+            ),
+            torch.randn(
+                3,
+                8,
+                dtype=torch.bfloat16,
+                device=device,
+                generator=generator,
+            ),
             # This represents Gemma's already-adjusted weight. The fused call
             # must use it directly with weight_bias=0, never add one again.
-            torch.randn(8, dtype=torch.bfloat16, device=device) + 1,
+            torch.randn(
+                8,
+                dtype=torch.bfloat16,
+                device=device,
+                generator=generator,
+            )
+            + 1,
             torch.tensor(0.03125, dtype=torch.float32, device=device),
         )
 
@@ -657,39 +677,90 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
             self.skipTest("CUDA required for FlashInfer FP8 fusion contract")
 
         input_tensor, residual, weight, scale = self._inputs()
+        generator = torch.Generator(device=input_tensor.device)
+        generator.manual_seed(11)
         noncontiguous_input = torch.randn(
-            8, 3, dtype=input_tensor.dtype, device=input_tensor.device
+            8,
+            3,
+            dtype=input_tensor.dtype,
+            device=input_tensor.device,
+            generator=generator,
         ).t()
         noncontiguous_residual = torch.randn(
-            8, 3, dtype=residual.dtype, device=residual.device
+            8,
+            3,
+            dtype=residual.dtype,
+            device=residual.device,
+            generator=generator,
         ).t()
         noncontiguous_weight = torch.randn(
-            16, dtype=weight.dtype, device=weight.device
+            16,
+            dtype=weight.dtype,
+            device=weight.device,
+            generator=generator,
         )[::2]
         cases = (
-            ("group_capability_unavailable", {}, {"capability_available": False}),
-            ("scale_absent", {"scale_factor": None}, {}),
+            (
+                "group_capability_unavailable",
+                {},
+                {"capability_available": False},
+                False,
+            ),
+            ("scale_absent", {"scale_factor": None}, {}, False),
             (
                 "scale_not_scalar",
                 {"scale_factor": torch.ones(2, device=scale.device)},
                 {},
+                False,
             ),
             (
                 "scale_wrong_device",
                 {"scale_factor": torch.tensor(scale.item(), device="cpu")},
                 {},
+                False,
             ),
-            ("input_noncontiguous", {"input_tensor": noncontiguous_input}, {}),
-            ("residual_noncontiguous", {"residual": noncontiguous_residual}, {}),
-            ("weight_noncontiguous", {"weight": noncontiguous_weight}, {}),
-            ("single_rank", {}, {"world_size": 1}),
+            (
+                "scale_wrong_dtype",
+                {
+                    "scale_factor": torch.tensor(
+                        scale.item(), dtype=torch.bfloat16, device=scale.device
+                    )
+                },
+                {},
+                False,
+            ),
+            (
+                "input_noncontiguous",
+                {"input_tensor": noncontiguous_input},
+                {},
+                False,
+            ),
+            (
+                "residual_noncontiguous",
+                {"residual": noncontiguous_residual},
+                {},
+                False,
+            ),
+            (
+                "weight_noncontiguous",
+                {"weight": noncontiguous_weight},
+                {},
+                False,
+            ),
+            ("single_rank", {}, {"world_size": 1}, False),
             (
                 "workspace_unavailable",
                 {},
                 {"workspace_available": False},
+                True,
             ),
         )
-        for name, argument_overrides, path_overrides in cases:
+        for (
+            name,
+            argument_overrides,
+            path_overrides,
+            expect_workspace_check,
+        ) in cases:
             fake_comm = _FakeFlashInferComm()
             arguments = {
                 "input_tensor": input_tensor,
@@ -703,7 +774,7 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
             arguments.update(argument_overrides)
             with self.subTest(name=name), self._patched_quant_path(
                 fake_comm, **path_overrides
-            ):
+            ) as (_, _, ensure_workspace):
                 result = (
                     fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
                         **arguments
@@ -712,6 +783,10 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
 
             self.assertEqual(result, (None, None, None))
             self.assertEqual(fake_comm.calls, [])
+            if expect_workspace_check:
+                ensure_workspace.assert_called_once()
+            else:
+                ensure_workspace.assert_not_called()
 
     def test_static_fp8_quant_collective_exception_propagates(self):
         if not torch.cuda.is_available():
