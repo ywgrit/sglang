@@ -117,9 +117,11 @@ Performance contract:
 
 - Nsight Systems or CUDA-profiler evidence shows that the standalone static-FP8 quant kernel disappears at the wired sites.
 - Isolated two-rank latency uses interleaved A/B rounds after warm-up and reports median and tail distribution.
-- End-to-end H20 TP=2 decode compares identical model, workload, process, clocks, and software SHA. A gain is claimed only if it clears the measured A/A noise band.
+- End-to-end decode compares identical model, workload, process, clocks, and software SHA at the checkpoint's required TP size. A gain is claimed only if it clears the measured A/A noise band. The separate TP=2 kernel benchmark is not presented as proof that the full checkpoint fits or performs at TP=2.
 
-Before renting a GPU, the benchmark checkpoint and revision must be fixed and checked from metadata or a dry-run memory estimate. It must fit `2 x H20 96GB`, use an allowlisted architecture, contain a wired static per-tensor FP8 projection, enable FlashInfer all-reduce under TP=2 with DP attention off and `moe_a2a_backend=none`, and show the target standalone quant kernel in a baseline trace. If no such checkpoint is available, PR 1 remains a correctness/integration contribution and a different H20-compatible target takes the performance-claim slot.
+The exact end-to-end candidate is `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` at Hugging Face revision `8f590eae8f10bf55d9a46f79ea0280bde435c9f8`, the public checkpoint named by issue #31504. Hugging Face file metadata reports 26 safetensor shards totaling 243,575,846,403 bytes (226.848 GiB), or 56.712 GiB of weight files per rank at TP=4 before allocator, runtime, collective workspace, CUDA Graph, and KV-cache overhead. The model card's reference SGLang launch also uses TP=4. Therefore TP=2 is rejected for the full-model gate (113.424 GiB of weight files per rank), and the first fit candidate is one single-host `4 x H20 96GB` node; `4 x H100 80GB` has materially less runtime headroom and is not the default request.
+
+The raw checkpoint stores separate q/k/v and GDN qkv/z activation scales. The pinned quantization summary reports equal per-tensor calibration values for the packed parts sampled, and SGLang's `ModelOptFp8LinearMethod.process_weights_after_loading` collapses a packed scale vector with `.max()` to a scalar. Those facts are necessary but not sufficient: before collecting end-to-end numbers, the remote load-time gate must inspect the actual processed `qkv_proj.input_scale` and `in_proj_qkvz.input_scale` tensors and require CUDA placement, `torch.float32`, contiguity, and `numel() == 1`. If that gate fails, stop the model run and report the checkpoint incompatible rather than claiming the fusion was exercised.
 
 ### PR 2 — Gated RMSNorm + static FP8 quantization
 
@@ -172,7 +174,7 @@ Tests follow #1357's adapter acceptance contract: eligible real request, A-B-A s
 ## Execution order and dependency rules
 
 1. Coordinate ownership for #31504 Step 3 before substantive coding, then implement PR 1 locally and run CPU/mock tests before renting a GPU. Open a draft PR early once the local contract is credible.
-2. Rent one two-card H20 NVLink instance only when PR 1 reaches the GPU-validation gate and the checkpoint gate is satisfied.
+2. Rent one single-host four-card H20 96GB instance only when PR 1 reaches the GPU-validation gate. Use ranks 0-1 on that node for the TP=2 kernel benchmark, then all four ranks for the pinned TP=4 checkpoint; do not keep a second instance idle.
 3. Do not begin PR 2 until PR 1 has a reviewable commit; reuse shared tuple infrastructure but keep the gated-norm kernel and evidence independent.
 4. Run PR 3 and PR 4 qualification profiles before treating them as PR slots. A failed promotion gate selects a fallback.
 5. PR 5 may proceed independently after refreshing #1357 ownership and dependencies.
@@ -187,7 +189,7 @@ Local laptop:
 - one isolated git worktree per feature branch
 - raw benchmark schema and command lines prepared before GPU rental
 
-Remote H20 instance:
+Remote `4 x H20 96GB` instance:
 
 - exact source commit transferred through git
 - environment and model cache retained on the instance data disk
@@ -207,6 +209,9 @@ Before performance work, record:
 - `nccl-tests` two-rank all-reduce bandwidth
 - PyTorch, SGLang, SGLang-Omni, FlashInfer, Triton, and model revisions
 - Nsight Systems availability and Nsight Compute counter permission
+- at least 400 GB of persistent free storage for the 243.6 GB checkpoint, source, wheels, logs, and traces
+- enough host RAM and swap policy to avoid CPU OOM during four-rank checkpoint loading
+- successful post-load scalar/device inspection for both the packed full-attention QKV and GDN QKVZ projections before benchmarking
 
 If peer access or NVLink is absent, PR 1 may still receive correctness testing, but no representative communication-performance claim is made.
 
