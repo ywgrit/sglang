@@ -350,6 +350,7 @@ class TestQwen35FullAttentionFusedArRouting(unittest.TestCase):
             qwen35,
             "fused_qk_gemma_rmsnorm_rope_gate",
             return_value=(q, k, gate),
+            create=True,
         ):
             prepared = qwen35.Qwen3_5AttentionDecoderLayer.forward_prepare_cuda_fused(
                 self.attn, self.positions, self.fused
@@ -368,11 +369,37 @@ class TestQwen35FusedArRegistration(unittest.TestCase):
         "fused_ar_quant_linear",
     }
 
-    def _decision(self, linear, *, keep_bf16, cuda, aiter):
+    def _decision(
+        self,
+        linear,
+        *,
+        keep_bf16,
+        cuda,
+        aiter,
+        enable_aiter_allreduce_fusion=True,
+    ):
         clear_gate_cache = getattr(
             qwen35._enable_qwen35_fused_ar_quant, "cache_clear", lambda: None
         )
         clear_gate_cache()
+        if cuda:
+            get_exec_patch = mock.patch.object(
+                qwen35,
+                "get_exec",
+                side_effect=AssertionError("CUDA registration queried runtime gate"),
+            )
+        else:
+            get_exec_patch = mock.patch.object(
+                qwen35,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    comm=SimpleNamespace(
+                        enable_aiter_allreduce_fusion=(
+                            enable_aiter_allreduce_fusion
+                        )
+                    )
+                ),
+            )
         try:
             with (
                 mock.patch.multiple(
@@ -381,11 +408,7 @@ class TestQwen35FusedArRegistration(unittest.TestCase):
                     _is_hip=aiter,
                     _use_aiter=aiter,
                 ),
-                mock.patch.object(
-                    qwen35,
-                    "get_exec",
-                    side_effect=AssertionError("process-local collective queried"),
-                ),
+                get_exec_patch,
                 mock.patch.object(
                     flashinfer_ar,
                     "_is_allreduce_quant_capability_available_for_group",
@@ -431,6 +454,22 @@ class TestQwen35FusedArRegistration(unittest.TestCase):
         self.assertTrue(decision["enable_fused_ar_quant"])
         self.assertTrue(decision["fused_ar_quant_keep_bf16"])
         self.assertIs(decision["fused_ar_quant_linear"], in_proj_qkvz)
+
+    def test_amd_group_registration_preserves_aiter_runtime_gate(self):
+        in_proj_qkvz = _group_linear(block=True)
+
+        decision = self._decision(
+            in_proj_qkvz,
+            keep_bf16=True,
+            cuda=False,
+            aiter=True,
+            enable_aiter_allreduce_fusion=False,
+        )
+
+        self.assertEqual(set(decision), self.EXPECTED_KEYS)
+        self.assertFalse(decision["enable_fused_ar_quant"])
+        self.assertTrue(decision["fused_ar_quant_keep_bf16"])
+        self.assertIsNone(decision["fused_ar_quant_linear"])
 
     def test_modelopt_vector_scale_is_eligible_before_weights_are_loaded(self):
         qkv_proj = _static_linear(modelopt=True, scale=torch.ones(8))
