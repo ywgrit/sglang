@@ -514,6 +514,161 @@ def _torch_static_fp8_quant(tensor_fp32, scale_factor):
     ).to(torch.float8_e4m3fn)
 
 
+class TestFlashInferWorkspaceIdentity(CustomTestCase):
+    def test_initialized_workspace_is_recreated_for_identity_mismatch(self):
+        old_device_group = object()
+        old_cpu_group = object()
+        new_device_group = object()
+        new_cpu_group = object()
+        cases = (
+            (
+                "group_and_rank",
+                {
+                    "rank": 0,
+                    "group": (old_device_group, old_cpu_group),
+                    "backend": "trtllm",
+                    "dtype": torch.bfloat16,
+                },
+                {
+                    "rank": 1,
+                    "backend": "trtllm",
+                    "dtype": torch.bfloat16,
+                },
+            ),
+            (
+                "backend",
+                {
+                    "rank": 1,
+                    "group": (new_device_group, new_cpu_group),
+                    "backend": "trtllm",
+                    "dtype": torch.bfloat16,
+                },
+                {
+                    "rank": 1,
+                    "backend": "mnnvl",
+                    "dtype": torch.bfloat16,
+                },
+            ),
+            (
+                "dtype",
+                {
+                    "rank": 1,
+                    "group": (new_device_group, new_cpu_group),
+                    "backend": "trtllm",
+                    "dtype": torch.bfloat16,
+                },
+                {
+                    "rank": 1,
+                    "backend": "trtllm",
+                    "dtype": torch.float16,
+                },
+            ),
+        )
+        for case_name, old_identity, requested_identity in cases:
+            with self.subTest(case_name=case_name):
+                manager = fusion.FlashInferWorkspaceManager()
+                old_workspace = _FakeWorkspace(
+                    old_identity["backend"], 2, dtype=old_identity["dtype"]
+                )
+                old_workspace.is_buffer_size_sufficient = MagicMock(
+                    return_value=True
+                )
+                manager.workspace = old_workspace
+                manager.initialized = True
+                manager.world_size = 2
+                manager.rank = old_identity["rank"]
+                manager.group = old_identity["group"]
+                manager.max_token_num = 16
+                manager.hidden_dim = 8
+                manager.dtype = old_identity["dtype"]
+                manager.backend = old_identity["backend"]
+                manager.use_fp32_lamport = False
+
+                new_workspace = _FakeWorkspace(
+                    requested_identity["backend"],
+                    2,
+                    dtype=requested_identity["dtype"],
+                )
+                create_workspace = MagicMock(return_value=new_workspace)
+                preflight = MagicMock(return_value=True)
+                with (
+                    patch.object(fusion, "_flashinfer_comm", _FakeFlashInferComm()),
+                    patch.object(
+                        fusion,
+                        "_create_allreduce_fusion_workspace",
+                        create_workspace,
+                    ),
+                    patch.object(
+                        fusion,
+                        "_flashinfer_create_workspace_supports_group",
+                        True,
+                    ),
+                    patch.object(
+                        fusion,
+                        "_flashinfer_create_workspace_supports_comm_backend",
+                        False,
+                    ),
+                    patch.object(fusion, "_TorchDistBackend", None),
+                    patch.object(fusion, "_mnnvl_comm_backend", None),
+                    patch.object(
+                        fusion,
+                        "_preflight_check_workspace_memory",
+                        preflight,
+                    ),
+                    patch.object(
+                        fusion,
+                        "in_the_same_node_as",
+                        return_value=[True, True],
+                    ),
+                    patch.object(
+                        fusion, "_flashinfer_allreduce_unavailable", False
+                    ),
+                ):
+                    manager.initialize(
+                        world_size=2,
+                        rank=requested_identity["rank"],
+                        max_token_num=16,
+                        hidden_dim=8,
+                        backend=requested_identity["backend"],
+                        group=new_cpu_group,
+                        dtype=requested_identity["dtype"],
+                        device_group=new_device_group,
+                        cpu_group=new_cpu_group,
+                    )
+
+                old_workspace.is_buffer_size_sufficient.assert_not_called()
+                create_workspace.assert_called_once()
+                preflight.assert_called_once_with(
+                    world_size=2,
+                    max_token_num=16,
+                    hidden_dim=8,
+                    dtype=requested_identity["dtype"],
+                    cpu_group=new_cpu_group,
+                )
+                self.assertIs(manager.workspace, new_workspace)
+                self.assertEqual(manager.rank, requested_identity["rank"])
+                self.assertEqual(
+                    manager.group, (new_device_group, new_cpu_group)
+                )
+                self.assertEqual(manager.backend, requested_identity["backend"])
+                self.assertEqual(manager.dtype, requested_identity["dtype"])
+                self.assertIs(
+                    create_workspace.call_args.kwargs["group"], new_device_group
+                )
+                self.assertEqual(
+                    create_workspace.call_args.kwargs["backend"],
+                    requested_identity["backend"],
+                )
+                self.assertEqual(
+                    create_workspace.call_args.kwargs["rank"],
+                    requested_identity["rank"],
+                )
+                self.assertEqual(
+                    create_workspace.call_args.kwargs["dtype"],
+                    requested_identity["dtype"],
+                )
+
+
 class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
     @contextlib.contextmanager
     def _patched_quant_path(
@@ -523,6 +678,7 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
         world_size=4,
         capability_available=True,
         workspace_available=True,
+        manager_overrides=None,
     ):
         cpu_group = object()
         coordinator = types.SimpleNamespace(
@@ -531,12 +687,22 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
             cpu_group=cpu_group,
             device_group=object(),
         )
-        workspace = _FakeWorkspace("trtllm", world_size)
-        manager = types.SimpleNamespace(
-            workspace=workspace,
-            initialized=True,
-            world_size=world_size,
-        )
+        manager_overrides = manager_overrides or {}
+        manager_dtype = manager_overrides.get("dtype", torch.bfloat16)
+        workspace = _FakeWorkspace("trtllm", world_size, dtype=manager_dtype)
+        manager = fusion.FlashInferWorkspaceManager()
+        manager.workspace = workspace
+        manager.initialized = True
+        manager.world_size = world_size
+        manager.rank = 0
+        manager.group = (coordinator.device_group, coordinator.cpu_group)
+        manager.max_token_num = 2048
+        manager.hidden_dim = 8
+        manager.dtype = manager_dtype
+        manager.backend = workspace.backend
+        manager.use_fp32_lamport = manager_dtype == torch.float32
+        for name, value in manager_overrides.items():
+            setattr(manager, name, value)
         parallel = types.SimpleNamespace(
             attn_tp_size=world_size,
             attn_tp_rank=0,
@@ -572,7 +738,7 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
         ):
             yield coordinator, manager, ensure_workspace
 
-    def _inputs(self):
+    def _inputs(self, dtype=torch.bfloat16):
         device = torch.device("cuda")
         generator = torch.Generator(device=device)
         generator.manual_seed(7)
@@ -580,14 +746,14 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
             torch.randn(
                 3,
                 8,
-                dtype=torch.bfloat16,
+                dtype=dtype,
                 device=device,
                 generator=generator,
             ),
             torch.randn(
                 3,
                 8,
-                dtype=torch.bfloat16,
+                dtype=dtype,
                 device=device,
                 generator=generator,
             ),
@@ -595,7 +761,7 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
             # must use it directly with weight_bias=0, never add one again.
             torch.randn(
                 8,
-                dtype=torch.bfloat16,
+                dtype=dtype,
                 device=device,
                 generator=generator,
             )
@@ -699,6 +865,9 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
             device=weight.device,
             generator=generator,
         )[::2]
+        float64_input, float64_residual, float64_weight, _ = self._inputs(
+            dtype=torch.float64
+        )
         cases = (
             (
                 "group_capability_unavailable",
@@ -747,6 +916,16 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
                 {},
                 False,
             ),
+            (
+                "unsupported_matching_dtype",
+                {
+                    "input_tensor": float64_input,
+                    "residual": float64_residual,
+                    "weight": float64_weight,
+                },
+                {},
+                False,
+            ),
             ("single_rank", {}, {"world_size": 1}, False),
             (
                 "workspace_unavailable",
@@ -787,6 +966,173 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
                 ensure_workspace.assert_called_once()
             else:
                 ensure_workspace.assert_not_called()
+
+    def test_static_fp8_quant_rejects_invalid_manager_after_ensure(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for FlashInfer FP8 fusion contract")
+
+        input_tensor, residual, weight, scale = self._inputs()
+        cases = (
+            ("missing_workspace", {"workspace": None}),
+            ("wrong_group", {"group": (object(), object())}),
+        )
+        for case_name, manager_overrides in cases:
+            fake_comm = _FakeFlashInferComm()
+            with self.subTest(case_name=case_name), self._patched_quant_path(
+                fake_comm, manager_overrides=manager_overrides
+            ) as (_, _, ensure_workspace):
+                with self.assertRaises(RuntimeError):
+                    fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+                        input_tensor=input_tensor,
+                        residual=residual,
+                        weight=weight,
+                        scale_factor=scale,
+                        use_attn_tp_group=False,
+                    )
+
+            ensure_workspace.assert_called_once()
+            self.assertEqual(fake_comm.calls, [])
+
+    def test_static_fp8_quant_compile_uses_preinitialized_metadata_only(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for FlashInfer FP8 fusion contract")
+
+        input_tensor, residual, weight, scale = self._inputs()
+        fake_comm = _FakeFlashInferComm()
+        expected = (
+            torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn),
+            torch.empty_like(residual),
+            input_tensor.new_empty((0,)),
+        )
+        private_op = MagicMock(return_value=expected)
+        with self._patched_quant_path(fake_comm) as (
+            _,
+            manager,
+            ensure_workspace,
+        ):
+            manager.is_buffer_size_sufficient = MagicMock(
+                side_effect=AssertionError(
+                    "compile preflight must not call the manager validator"
+                )
+            )
+            manager.workspace.is_buffer_size_sufficient = MagicMock(
+                side_effect=AssertionError(
+                    "compile preflight must not call the opaque workspace"
+                )
+            )
+            with (
+                patch.object(torch.compiler, "is_compiling", return_value=True),
+                patch.object(
+                    fusion,
+                    "_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op",
+                    private_op,
+                ),
+            ):
+                result = (
+                    fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+                        input_tensor=input_tensor,
+                        residual=residual,
+                        weight=weight,
+                        scale_factor=scale,
+                        use_attn_tp_group=False,
+                    )
+                )
+
+        self.assertIs(result, expected)
+        ensure_workspace.assert_not_called()
+        manager.is_buffer_size_sufficient.assert_not_called()
+        manager.workspace.is_buffer_size_sufficient.assert_not_called()
+        private_op.assert_called_once()
+        self.assertEqual(fake_comm.calls, [])
+
+    def test_static_fp8_quant_compile_rejects_invalid_static_workspace(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for FlashInfer FP8 fusion contract")
+
+        input_tensor, residual, weight, scale = self._inputs()
+        cases = (
+            ("token_capacity", {"max_token_num": input_tensor.shape[0] - 1}),
+            ("hidden_capacity", {"hidden_dim": input_tensor.shape[-1] - 1}),
+            ("dtype", {"dtype": torch.float16}),
+            ("rank", {"rank": 1}),
+            ("group", {"group": (object(), object())}),
+        )
+        for case_name, manager_overrides in cases:
+            fake_comm = _FakeFlashInferComm()
+            private_op = MagicMock(
+                side_effect=AssertionError("invalid metadata reached kernel")
+            )
+            with self.subTest(case_name=case_name), self._patched_quant_path(
+                fake_comm, manager_overrides=manager_overrides
+            ) as (_, manager, ensure_workspace):
+                manager.is_buffer_size_sufficient = MagicMock(
+                    side_effect=AssertionError(
+                        "compile preflight must use static capacity metadata"
+                    )
+                )
+                manager.workspace.is_buffer_size_sufficient = MagicMock(
+                    side_effect=AssertionError(
+                        "compile preflight must not call the opaque workspace"
+                    )
+                )
+                with (
+                    patch.object(
+                        torch.compiler, "is_compiling", return_value=True
+                    ),
+                    patch.object(
+                        fusion,
+                        "_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op",
+                        private_op,
+                    ),
+                ):
+                    result = fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+                        input_tensor=input_tensor,
+                        residual=residual,
+                        weight=weight,
+                        scale_factor=scale,
+                        use_attn_tp_group=False,
+                    )
+
+            self.assertEqual(result, (None, None, None))
+            ensure_workspace.assert_not_called()
+            manager.is_buffer_size_sufficient.assert_not_called()
+            manager.workspace.is_buffer_size_sufficient.assert_not_called()
+            private_op.assert_not_called()
+            self.assertEqual(fake_comm.calls, [])
+
+    def test_static_fp8_quant_accepts_supported_cuda_dtypes(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for FlashInfer FP8 fusion contract")
+
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                input_tensor, residual, weight, scale = self._inputs(dtype=dtype)
+                fake_comm = _FakeFlashInferComm()
+                expected = (
+                    torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn),
+                    torch.empty_like(residual),
+                    input_tensor.new_empty((0,)),
+                )
+                private_op = MagicMock(return_value=expected)
+                with self._patched_quant_path(
+                    fake_comm, manager_overrides={"dtype": dtype}
+                ) as (_, _, ensure_workspace), patch.object(
+                    fusion,
+                    "_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant_op",
+                    private_op,
+                ):
+                    result = fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+                        input_tensor=input_tensor,
+                        residual=residual,
+                        weight=weight,
+                        scale_factor=scale,
+                        use_attn_tp_group=False,
+                    )
+
+                self.assertIs(result, expected)
+                ensure_workspace.assert_called_once()
+                private_op.assert_called_once()
+                self.assertEqual(fake_comm.calls, [])
 
     def test_static_fp8_quant_collective_exception_propagates(self):
         if not torch.cuda.is_available():
