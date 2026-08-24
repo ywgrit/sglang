@@ -324,6 +324,71 @@ class TestFlashInferAllReduceQuantCapability(CustomTestCase):
             if not expect_initialization:
                 initialize.assert_not_called()
 
+    def test_missing_local_comm_votes_unavailable(self):
+        tp_cpu_group = object()
+
+        def emulate_vote(flag, *, op, group):
+            self.assertEqual(flag.item(), 1)
+            self.assertIs(op, fusion.dist.ReduceOp.MAX)
+            self.assertIs(group, tp_cpu_group)
+
+        with (
+            patch.object(fusion, "_flashinfer_allreduce_unavailable", False),
+            patch.object(fusion, "_flashinfer_comm", None),
+            patch.object(
+                fusion,
+                "get_tp_group",
+                return_value=types.SimpleNamespace(
+                    world_size=4, cpu_group=tp_cpu_group
+                ),
+            ),
+            patch.object(fusion.dist, "all_reduce", side_effect=emulate_vote),
+        ):
+            fusion._sync_allreduce_unavailable_across_tp()
+
+            self.assertTrue(fusion._flashinfer_allreduce_unavailable)
+
+    def test_remote_unavailable_vote_updates_global_flag(self):
+        tp_cpu_group = object()
+
+        def emulate_vote(flag, *, op, group):
+            self.assertEqual(flag.item(), 0)
+            self.assertIs(op, fusion.dist.ReduceOp.MAX)
+            self.assertIs(group, tp_cpu_group)
+            flag.fill_(1)
+
+        with (
+            patch.object(fusion, "_flashinfer_allreduce_unavailable", False),
+            patch.object(fusion, "_flashinfer_comm", _FakeFlashInferComm()),
+            patch.object(
+                fusion,
+                "get_tp_group",
+                return_value=types.SimpleNamespace(
+                    world_size=4, cpu_group=tp_cpu_group
+                ),
+            ),
+            patch.object(fusion.dist, "all_reduce", side_effect=emulate_vote),
+        ):
+            fusion._sync_allreduce_unavailable_across_tp()
+
+            self.assertTrue(fusion._flashinfer_allreduce_unavailable)
+
+    def test_single_rank_missing_comm_sets_unavailable_without_collective(self):
+        with (
+            patch.object(fusion, "_flashinfer_allreduce_unavailable", False),
+            patch.object(fusion, "_flashinfer_comm", None),
+            patch.object(
+                fusion,
+                "get_tp_group",
+                return_value=types.SimpleNamespace(world_size=1),
+            ),
+            patch.object(fusion.dist, "all_reduce") as all_reduce,
+        ):
+            fusion._sync_allreduce_unavailable_across_tp()
+
+            self.assertTrue(fusion._flashinfer_allreduce_unavailable)
+            all_reduce.assert_not_called()
+
     def test_hybrid_ep_failure_is_voted_across_enclosing_tp(self):
         tp_cpu_group = object()
 
@@ -341,6 +406,9 @@ class TestFlashInferAllReduceQuantCapability(CustomTestCase):
                     fusion,
                     "_flashinfer_allreduce_unavailable",
                     local_unavailable,
+                ),
+                patch.object(
+                    fusion, "_flashinfer_comm", _FakeFlashInferComm()
                 ),
                 patch.object(
                     fusion,

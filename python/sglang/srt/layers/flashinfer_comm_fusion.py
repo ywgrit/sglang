@@ -721,30 +721,34 @@ def _is_allreduce_quant_capability_available_for_group(
 def _sync_allreduce_unavailable_across_tp():
     """Synchronize _flashinfer_allreduce_unavailable across all TP ranks.
 
-    If workspace initialization fails on any rank, all ranks must agree to
-    disable fusion. Otherwise ranks diverge during CUDA graph capture: some
-    use FlashInfer fusion (skipping custom allreduce), others fall back to
-    standard allreduce (calling register_buffer collectives), causing a hang
-    in register_graph_buffers.
+    If FlashInfer comm is missing or workspace initialization fails on any
+    rank, all ranks must agree to disable fusion. Otherwise ranks diverge
+    during CUDA graph capture: some use FlashInfer fusion (skipping custom
+    allreduce), others fall back to standard allreduce (calling
+    register_buffer collectives), causing a hang in register_graph_buffers.
     """
     global _flashinfer_allreduce_unavailable
     try:
         import torch.distributed as dist
 
+        was_unavailable = _flashinfer_allreduce_unavailable
+        local_unavailable = was_unavailable or _flashinfer_comm is None
         tp_group = get_tp_group()
         if tp_group.world_size <= 1:
+            _flashinfer_allreduce_unavailable = local_unavailable
             return
         flag = torch.tensor(
-            [1 if _flashinfer_allreduce_unavailable else 0],
+            [1 if local_unavailable else 0],
             dtype=torch.int32,
             device="cpu",
         )
         dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=tp_group.cpu_group)
-        if flag.item() > 0 and not _flashinfer_allreduce_unavailable:
-            _flashinfer_allreduce_unavailable = True
+        _flashinfer_allreduce_unavailable = flag.item() > 0
+        if _flashinfer_allreduce_unavailable and not was_unavailable:
             logger.warning(
                 "FlashInfer allreduce fusion disabled globally because "
-                "workspace initialization failed on at least one rank."
+                "it is unavailable or workspace initialization failed on "
+                "at least one rank."
             )
     except Exception as e:
         logger.debug(f"Failed to sync flashinfer unavailable flag: {e}")
