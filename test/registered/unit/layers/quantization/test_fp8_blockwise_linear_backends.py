@@ -5,15 +5,24 @@ blockwise, MXFP8, and per-tensor FP8 (auto dispatch). Backend sets adapt to
 the device SM, so one file covers SM90 / SM100 / SM120.
 """
 
+import sys
+import types
 import unittest
 from unittest import mock
 
 import torch
 
-from sglang.srt.layers.quantization import fp8_utils
+from sglang.srt.layers.layernorm import (
+    _fp8_static_input_scale,
+    _is_static_per_tensor_fp8_linear,
+)
+from sglang.srt.layers.quantization import fp8_utils, modelopt_quant
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp8Config,
+    ModelOptFp8LinearMethod,
+)
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import (
@@ -106,6 +115,136 @@ def _make_linear(quant_config, n: int, k: int):
     return make_tp1_column_parallel_linear(
         quant_config, n, k, skip_block_quant_check=True
     )
+
+
+class TestModeloptFp8PrequantizedDispatch(CustomTestCase):
+    """CPU/mock contracts for ModelOpt's fused-RMSNorm FP8 hand-off."""
+
+    @staticmethod
+    def _make_method(*, use_marlin: bool = False):
+        # ModelOptFp8LinearMethod.__init__ probes the active accelerator.  These
+        # dispatch tests exercise no kernel, so construct the real method type
+        # while making every hardware-derived choice explicit.
+        method = ModelOptFp8LinearMethod.__new__(ModelOptFp8LinearMethod)
+        method.quant_config = mock.sentinel.quant_config
+        method.cutlass_fp8_supported = True
+        method.enable_flashinfer_bmm = True
+        method.use_marlin = use_marlin
+        method.use_sm120_gemv = True
+        return method
+
+    @staticmethod
+    def _make_sm120_module():
+        module = types.ModuleType("sglang.kernels.ops.gemm.sm120_fp8_gemv")
+        module.use_sm120_fp8_gemv = mock.Mock(return_value=True)
+        module.sm120_fp8_gemv = mock.Mock()
+        return module
+
+    def test_tuple_dispatches_directly_to_fp8_linear(self):
+        method = self._make_method()
+        qinput = torch.empty((2, 16), dtype=torch.float8_e4m3fn)
+        input_scale = torch.tensor(0.125)
+        bias = torch.randn(8, dtype=torch.bfloat16)
+        layer = types.SimpleNamespace(
+            weight=torch.empty((16, 8), dtype=torch.float8_e4m3fn),
+            weight_scale=torch.tensor(0.25),
+            input_scale=torch.tensor(0.5),
+            use_flashinfer_bmm=True,
+            sm120_gemv_alpha=torch.ones(1),
+        )
+        expected = torch.empty((2, 8), dtype=torch.bfloat16)
+        sm120_module = self._make_sm120_module()
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {"sglang.kernels.ops.gemm.sm120_fp8_gemv": sm120_module},
+            ),
+            mock.patch.object(
+                modelopt_quant, "apply_fp8_linear", return_value=expected
+            ) as fp8_linear,
+            mock.patch.object(
+                modelopt_quant, "apply_fp8_linear_bmm_flashinfer"
+            ) as flashinfer_bmm,
+            mock.patch.object(fp8_utils, "static_quant_fp8") as requantize,
+        ):
+            actual = method.apply(
+                layer, (qinput, input_scale, torch.bfloat16), bias=bias
+            )
+
+        self.assertIs(actual, expected)
+        fp8_linear.assert_called_once_with(
+            input=qinput,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            input_scale=input_scale,
+            bias=bias,
+            cutlass_fp8_supported=True,
+            pre_quant_output_dtype=torch.bfloat16,
+        )
+        flashinfer_bmm.assert_not_called()
+        requantize.assert_not_called()
+        sm120_module.use_sm120_fp8_gemv.assert_not_called()
+        sm120_module.sm120_fp8_gemv.assert_not_called()
+
+    def test_marlin_rejects_tuple_before_accessing_rearranged_weights(self):
+        method = self._make_method(use_marlin=True)
+        qinput = torch.empty((2, 16), dtype=torch.float8_e4m3fn)
+        input_scale = torch.tensor(0.125)
+
+        class PoisonedMarlinLayer:
+            @property
+            def weight(self):
+                raise AssertionError("Marlin weight must not be read")
+
+        marlin_op = mock.Mock()
+        fake_sglang_ops = types.SimpleNamespace(apply_fp8_marlin_linear=marlin_op)
+        with (
+            mock.patch.object(torch.ops, "sglang", fake_sglang_ops),
+            self.assertRaises(ValueError),
+        ):
+            method.apply(
+                PoisonedMarlinLayer(),
+                (qinput, input_scale, torch.bfloat16),
+            )
+        marlin_op.assert_not_called()
+
+    def test_modelopt_static_scale_construction_and_forward_eligibility(self):
+        method = self._make_method()
+        pre_load_scale = torch.ones(3, dtype=torch.float32)
+        layer = types.SimpleNamespace(
+            quant_method=method,
+            input_scale=pre_load_scale,
+        )
+
+        self.assertTrue(_is_static_per_tensor_fp8_linear(method, layer))
+        self.assertIsNone(_fp8_static_input_scale(layer))
+
+        finalized_scale = torch.tensor(0.125, dtype=torch.float32)
+        layer.input_scale = finalized_scale
+        self.assertTrue(_is_static_per_tensor_fp8_linear(method, layer))
+        self.assertIs(_fp8_static_input_scale(layer), finalized_scale)
+
+    def test_modelopt_marlin_or_missing_scale_is_ineligible(self):
+        marlin_method = self._make_method(use_marlin=True)
+        marlin_layer = types.SimpleNamespace(
+            quant_method=marlin_method,
+            input_scale=torch.tensor(0.125),
+        )
+        self.assertFalse(
+            _is_static_per_tensor_fp8_linear(marlin_method, marlin_layer)
+        )
+        self.assertIsNone(_fp8_static_input_scale(marlin_layer))
+
+        method = self._make_method()
+        missing_scale_layer = types.SimpleNamespace(
+            quant_method=method,
+            input_scale=None,
+        )
+        self.assertFalse(
+            _is_static_per_tensor_fp8_linear(method, missing_scale_layer)
+        )
+        self.assertIsNone(_fp8_static_input_scale(missing_scale_layer))
 
 
 class _LinearBackendCheck(CustomTestCase):
@@ -264,6 +403,54 @@ class TestModeloptFp8PerTensorLinear(_LinearBackendCheck):
 
     def test_auto(self):
         self._check_backend("auto", ["auto"], PER_TENSOR_SHAPES, self._build_layer)
+
+    def test_prequantized_tuple_matches_bf16_and_skips_requantization(self):
+        torch.manual_seed(11)
+        layer, _ = self._build_layer(n=256, k=512)
+        layer.quant_method.process_weights_after_loading(layer)
+        method = layer.quant_method
+
+        # Establish the ordinary static-FP8 result without either optional
+        # specialized path, then hand the exact same quantized activation to
+        # ModelOpt as a fused producer would.
+        method.use_sm120_gemv = False
+        layer.use_flashinfer_bmm = False
+        x = torch.randn((5, 512), device="cuda", dtype=torch.bfloat16) / 10
+        reference = method.apply(layer, x)
+        qinput, _ = fp8_utils.static_quant_fp8(
+            x, layer.input_scale, repeat_scale=False
+        )
+
+        method.use_sm120_gemv = True
+        layer.use_flashinfer_bmm = True
+        layer.sm120_gemv_alpha = torch.ones(1, device="cuda")
+        sm120_module = TestModeloptFp8PrequantizedDispatch._make_sm120_module()
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {"sglang.kernels.ops.gemm.sm120_fp8_gemv": sm120_module},
+            ),
+            mock.patch.object(
+                fp8_utils,
+                "static_quant_fp8",
+                wraps=fp8_utils.static_quant_fp8,
+            ) as requantize,
+            mock.patch.object(
+                modelopt_quant, "apply_fp8_linear_bmm_flashinfer"
+            ) as flashinfer_bmm,
+        ):
+            output = method.apply(
+                layer,
+                (qinput, layer.input_scale, torch.bfloat16),
+            )
+
+        requantize.assert_not_called()
+        flashinfer_bmm.assert_not_called()
+        sm120_module.use_sm120_fp8_gemv.assert_not_called()
+        sm120_module.sm120_fp8_gemv.assert_not_called()
+        self.assertEqual(output.shape, reference.shape)
+        self.assertEqual(output.dtype, torch.bfloat16)
+        assert_output_close(self, output, reference, rtol=5e-2, atol=1e-1)
 
 
 if __name__ == "__main__":
