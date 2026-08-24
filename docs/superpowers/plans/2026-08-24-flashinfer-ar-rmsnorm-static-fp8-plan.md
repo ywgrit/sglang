@@ -577,9 +577,23 @@ Validate that `apply_fp8_linear` accepts `pre_quant_output_dtype` on the pinned 
 
 **Step 4: Recognize ModelOpt as a static per-tensor consumer**
 
-Extend `_is_static_per_tensor_fp8_linear`:
+Tighten native FP8 and extend `_is_static_per_tensor_fp8_linear` for ModelOpt.
+Construction-time capability requires that an `input_scale` parameter exists,
+but deliberately does not require `numel() == 1`:
 
 ```python
+input_scale = getattr(linear, "input_scale", None)
+if input_scale is None:
+    return False
+
+# Keep the existing imports/class checks.
+if isinstance(quant_method, Fp8LinearMethod):
+    return not (
+        getattr(quant_method, "block_quant", False)
+        or getattr(quant_method, "use_mxfp8", False)
+        or getattr(quant_method, "use_marlin", False)
+    )
+
 try:
     from sglang.srt.layers.quantization.modelopt_quant import (
         ModelOptFp8LinearMethod,
@@ -590,7 +604,10 @@ if isinstance(quant_method, ModelOptFp8LinearMethod):
     return not getattr(quant_method, "use_marlin", False)
 ```
 
-The existing `_fp8_static_input_scale` scalar check remains authoritative after this class check.
+This excludes native dynamic-activation FP8 (`input_scale is None`) while still
+allowing ModelOpt's pre-load vector parameter. The existing
+`_fp8_static_input_scale` `numel() == 1` check remains authoritative after this
+class check at forward time.
 
 **Step 5: Run GREEN and the existing ModelOpt backend test**
 
