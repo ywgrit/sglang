@@ -1,9 +1,9 @@
 import contextlib
 import importlib.util
 import inspect
-from pathlib import Path
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -984,6 +984,81 @@ class TestFlashInferAllReduceStaticFp8Quant(CustomTestCase):
                     self.assertIs(call["norm_out"], norm_out)
                 else:
                     self.assertIsNone(call["norm_out"])
+
+    def test_static_fp8_quant_registered_op_cuda_graph_replays_new_input(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for registered-op graph smoke")
+        capability = torch.cuda.get_device_capability()
+        if capability < (8, 9):
+            self.skipTest(
+                "native float8_e4m3fn CUDA graph smoke requires compute "
+                f"capability >= 8.9; got {capability[0]}.{capability[1]}"
+            )
+
+        world_size = 4
+        eps = 1e-6
+        for keep_bf16 in (False, True):
+            with self.subTest(keep_bf16=keep_bf16):
+                input_tensor, residual, weight, scale = self._inputs()
+                scale_pointer = scale.data_ptr()
+                fake_comm = _FakeFlashInferComm()
+
+                with self._patched_quant_path(fake_comm, world_size=world_size):
+                    warmup_stream = torch.cuda.Stream()
+                    warmup_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(warmup_stream):
+                        fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+                            input_tensor=input_tensor,
+                            residual=residual,
+                            weight=weight,
+                            scale_factor=scale,
+                            eps=eps,
+                            use_attn_tp_group=False,
+                            keep_bf16=keep_bf16,
+                        )
+                    torch.cuda.current_stream().wait_stream(warmup_stream)
+                    torch.cuda.synchronize()
+
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        quant_out, residual_out, norm_out = (
+                            fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+                                input_tensor=input_tensor,
+                                residual=residual,
+                                weight=weight,
+                                scale_factor=scale,
+                                eps=eps,
+                                use_attn_tp_group=False,
+                                keep_bf16=keep_bf16,
+                            )
+                        )
+
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    first_residual = residual_out.clone()
+                    input_tensor.mul_(0.5).add_(0.125)
+                    residual.mul_(-0.25).add_(0.375)
+                    graph.replay()
+                    torch.cuda.synchronize()
+
+                self.assertEqual(scale.data_ptr(), scale_pointer)
+                self.assertFalse(torch.equal(residual_out, first_residual))
+                expected_norm, expected_residual = (
+                    _torch_allreduce_residual_rmsnorm_baseline(
+                        input_tensor, residual, weight, world_size, eps
+                    )
+                )
+                expected_quant = _torch_static_fp8_quant(
+                    _torch_rmsnorm_fp32(expected_residual, weight, eps), scale
+                )
+                torch.testing.assert_close(residual_out, expected_residual)
+                if keep_bf16:
+                    torch.testing.assert_close(norm_out, expected_norm)
+                else:
+                    self.assertEqual(norm_out.numel(), 0)
+                torch.testing.assert_close(
+                    quant_out.float(), expected_quant.float(), rtol=0, atol=0
+                )
 
     def test_static_fp8_quant_fallbacks_happen_before_collective(self):
         if not torch.cuda.is_available():
