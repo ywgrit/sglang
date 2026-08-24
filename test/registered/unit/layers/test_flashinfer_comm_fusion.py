@@ -1,6 +1,8 @@
 import contextlib
 import importlib.util
 import inspect
+import io
+import json
 import types
 import unittest
 from pathlib import Path
@@ -86,6 +88,72 @@ class TestFlashInferAllReduceFp8BenchmarkContract(unittest.TestCase):
                 "correctness",
             }.issubset(benchmark.RESULT_FIELDS)
         )
+
+    def test_console_prints_complete_metadata_before_results(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+        metadata = {field: None for field in benchmark.METADATA_FIELDS}
+        metadata.update(
+            {
+                "command": "torchrun --nproc-per-node=2 benchmark.py",
+                "hostname": "host-a",
+                "gpu_names": ["GPU 0", "GPU 1"],
+                "gpu_topology": "GPU0 X NV2\nGPU1 NV2 X",
+                "backend": "trtllm",
+                "requested_backend": "auto",
+            }
+        )
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            benchmark._print_results(metadata, [])
+
+        rendered = output.getvalue()
+        self.assertTrue(rendered.startswith("{"), rendered)
+        parsed, table_offset = json.JSONDecoder().raw_decode(rendered)
+        self.assertEqual(parsed, metadata)
+        self.assertIn("mode   tokens case", rendered[table_offset:])
+
+    def test_torchrun_environment_requires_local_world_size_two(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+        valid = {
+            "RANK": "0",
+            "WORLD_SIZE": "2",
+            "LOCAL_RANK": "0",
+            "LOCAL_WORLD_SIZE": "2",
+        }
+
+        self.assertTrue(
+            hasattr(benchmark, "validate_torchrun_environment"),
+            "benchmark must expose pure torchrun environment validation",
+        )
+        self.assertEqual(
+            benchmark.validate_torchrun_environment(valid), (0, 2, 0)
+        )
+        with self.assertRaisesRegex(RuntimeError, "LOCAL_WORLD_SIZE=2"):
+            benchmark.validate_torchrun_environment(
+                {**valid, "LOCAL_WORLD_SIZE": "1"}
+            )
+        with self.assertRaisesRegex(RuntimeError, "LOCAL_WORLD_SIZE"):
+            benchmark.validate_torchrun_environment(
+                {
+                    key: value
+                    for key, value in valid.items()
+                    if key != "LOCAL_WORLD_SIZE"
+                }
+            )
+
+    def test_rank_placement_requires_one_host_and_local_ranks_zero_one(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+
+        self.assertTrue(
+            hasattr(benchmark, "validate_rank_placement"),
+            "benchmark must expose pure rank placement validation",
+        )
+        benchmark.validate_rank_placement([("host-a", 0), ("host-a", 1)])
+        with self.assertRaisesRegex(RuntimeError, "one host"):
+            benchmark.validate_rank_placement([("host-a", 0), ("host-b", 1)])
+        with self.assertRaisesRegex(RuntimeError, "local ranks"):
+            benchmark.validate_rank_placement([("host-a", 0), ("host-a", 0)])
 
 
 class _FakeWorkspace:

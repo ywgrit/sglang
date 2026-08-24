@@ -115,6 +115,52 @@ def positive_int(value):
     return parsed
 
 
+def validate_torchrun_environment(environ):
+    """Validate and return rank placement from a standard local torchrun."""
+    required = ("RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE")
+    missing = [name for name in required if name not in environ]
+    if missing:
+        raise RuntimeError(
+            "A standard torchrun environment is required; missing "
+            + ", ".join(missing)
+        )
+    try:
+        rank = int(environ["RANK"])
+        world_size = int(environ["WORLD_SIZE"])
+        local_rank = int(environ["LOCAL_RANK"])
+        local_world_size = int(environ["LOCAL_WORLD_SIZE"])
+    except ValueError as error:
+        raise RuntimeError(
+            "torchrun rank environment values must be integers"
+        ) from error
+    if world_size != 2 or local_world_size != 2:
+        raise RuntimeError(
+            "This benchmark requires WORLD_SIZE=2 and LOCAL_WORLD_SIZE=2; "
+            f"got WORLD_SIZE={world_size}, LOCAL_WORLD_SIZE={local_world_size}."
+        )
+    if rank not in (0, 1) or local_rank not in (0, 1):
+        raise RuntimeError(
+            "TP=2 torchrun ranks must be 0 or 1; "
+            f"got RANK={rank}, LOCAL_RANK={local_rank}."
+        )
+    return rank, world_size, local_rank
+
+
+def validate_rank_placement(placements):
+    """Require two ranks on one hostname, bound to distinct local GPUs."""
+    if len(placements) != 2 or len({hostname for hostname, _ in placements}) != 1:
+        raise RuntimeError(
+            "All two benchmark ranks must run on exactly one host; "
+            f"observed placements {placements}."
+        )
+    local_ranks = {local_rank for _, local_rank in placements}
+    if local_ranks != {0, 1}:
+        raise RuntimeError(
+            "The two benchmark local ranks must be exactly {0, 1}; "
+            f"observed placements {placements}."
+        )
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
@@ -727,10 +773,8 @@ def _format_measurement(value):
 
 
 def _print_results(metadata, results):
-    print(
-        f"GPU={metadata['gpu']} TP={metadata['world_size']} "
-        f"dtype={metadata['dtype']} backend={metadata['backend']}"
-    )
+    print(json.dumps(metadata, indent=2))
+    print()
     print(
         "mode   tokens case                                          "
         "correct p10(us) p50(us) p90(us) split-x existing-x"
@@ -773,14 +817,7 @@ def _validate_launch(runtime, args, world_size, local_rank):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    if world_size != 2:
-        raise RuntimeError(
-            "This benchmark requires exactly one local TP=2 torchrun job "
-            f"(WORLD_SIZE=2); got WORLD_SIZE={world_size}."
-        )
+    rank, world_size, local_rank = validate_torchrun_environment(os.environ)
     runtime = _load_runtime()
     _validate_launch(runtime, args, world_size, local_rank)
     runtime.torch.cuda.set_device(local_rank)
@@ -788,8 +825,7 @@ def main(argv=None):
     dtype = _dtype_from_name(runtime.torch, args.dtype)
     repo_root = Path(__file__).resolve().parents[2]
 
-    model_parallel_started = False
-    distributed_initialized = False
+    model_parallel_initialized = False
     results = []
     metadata = None
     runtime.set_custom_all_reduce(True)
@@ -805,17 +841,14 @@ def main(argv=None):
                 distributed_init_method="env://",
                 backend="nccl",
             )
-            distributed_initialized = True
-            model_parallel_started = True
             runtime.initialize_model_parallel(tensor_model_parallel_size=world_size)
+            model_parallel_initialized = True
 
-            hostnames = [None] * world_size
-            runtime.dist.all_gather_object(hostnames, socket.gethostname())
-            if len(set(hostnames)) != 1:
-                raise RuntimeError(
-                    "All ranks must run on one host; observed hostnames "
-                    f"{hostnames}."
-                )
+            placements = [None] * world_size
+            runtime.dist.all_gather_object(
+                placements, (socket.gethostname(), local_rank)
+            )
+            validate_rank_placement(placements)
 
             runtime.pre_initialize_workspaces(
                 max_token_num=max(args.tokens),
@@ -866,13 +899,13 @@ def main(argv=None):
                 )
         finally:
             try:
-                if model_parallel_started:
+                if model_parallel_initialized:
                     try:
                         runtime.cleanup_flashinfer_workspace()
                     finally:
                         runtime.destroy_model_parallel()
             finally:
-                if distributed_initialized:
+                if runtime.dist.is_initialized():
                     runtime.destroy_distributed_environment()
 
     return 0
