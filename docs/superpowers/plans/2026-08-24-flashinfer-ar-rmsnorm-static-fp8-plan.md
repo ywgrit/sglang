@@ -452,13 +452,19 @@ if scale_factor is None or scale_factor.numel() != 1:
     return None, None, None
 if scale_factor.device != input_tensor.device:
     return None, None, None
+if scale_factor.dtype != torch.float32:
+    return None, None, None
 ```
 
-It performs all rank-invariant shape/dtype/contiguity checks, calls
-`ensure_workspace_initialized`, then invokes the private custom op. Fallback is
-legal only here, before the private op/collective is entered. This split is
-required because the registered op schema cannot declare Tensor outputs and
-then return `(None, None, None)`.
+FlashInfer v0.6.17 passes a tensor scale to the CUDA binding by reinterpreting
+its data pointer as `float*`, so accepting a BF16/FP16 scalar would silently
+misread the value. It performs all cheap, rank-invariant capability,
+world-size, shape, dtype, device, and contiguity checks before calling
+`ensure_workspace_initialized`; workspace initialization itself performs
+collectives and must not run for an input that has already failed preflight.
+It then invokes the private custom op. Fallback is legal only here, before the
+private op/collective is entered. This split is required because the registered
+op schema cannot declare Tensor outputs and then return `(None, None, None)`.
 
 Inside the private op, allocate outputs as in the fake. Select:
 
