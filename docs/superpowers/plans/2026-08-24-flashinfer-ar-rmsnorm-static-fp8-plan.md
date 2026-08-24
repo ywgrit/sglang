@@ -6,7 +6,7 @@
 
 **Architecture:** Add a fail-closed FlashInfer quant-fusion capability probe beside the existing unified AllReduce probe. Add one custom-op wrapper that selects FlashInfer pattern 2 (quant-only) or pattern 4 (BF16 + quant), returning tensor-only outputs. LayerNorm translates those tensors into the tuple contracts already accepted by SGLang FP8 linears. Qwen3.5 registers a consumer during construction based on quant-method capability (before ModelOpt scales are finalized); `LayerCommunicator` and LayerNorm validate the finalized scalar scale immediately before dispatch. Ineligible or not-yet-ready consumers retain the existing plain AllReduce + RMSNorm path. AMD per-group and CUDA per-tensor tuple contracts remain separate.
 
-**Tech Stack:** Python 3.10+, PyTorch custom ops/FakeTensor, FlashInfer `comm.allreduce_fusion`, SGLang `LayerCommunicator`, unittest/pytest, CUDA Graph capture, NCCL TP=2, NVIDIA H20/H100/H200.
+**Tech Stack:** Python 3.10+, PyTorch custom ops/FakeTensor, FlashInfer `comm.allreduce_fusion`, SGLang `LayerCommunicator`, unittest/pytest, CUDA Graph capture, NCCL TP=2 kernel validation plus checkpoint-sized TP=N, NVIDIA H20/H100/H200.
 
 ## Non-negotiable contracts
 
@@ -1163,7 +1163,7 @@ Required:
 
 - two H20/H100/H200 GPUs in one machine;
 - peer access/NVLink or the topology intended for the benchmark;
-- enough VRAM for the exact checkpoint at TP=2;
+- enough aggregate and per-rank VRAM for the exact checkpoint at the computed TP=N;
 - current NVIDIA driver compatible with the chosen PyTorch/FlashInfer image;
 - persistent data volume for source, wheels, and checkpoint cache.
 
@@ -1178,7 +1178,7 @@ workspace, CUDA Graph, and KV-cache headroom. Do not hard-code 2×H20: the
 overhead. A separate 2-GPU kernel benchmark does not prove the exact model fits
 two GPUs. Before this computed signal, keep saying no GPU is needed.
 
-### Task 14: Run two-GPU correctness, graph, and performance validation
+### Task 14: Run TP=2 kernel validation and checkpoint-sized end-to-end validation
 
 **Files:**
 - Create locally after the run: `artifacts/flashinfer-ar-rmsnorm-static-fp8/validation.md` (do not include large raw logs in the PR unless maintainers request them)
@@ -1208,13 +1208,19 @@ Run eager and graph modes for both FlashInfer backends supported by the hardware
 
 **Step 4: Run the exact Qwen3.5 checkpoint**
 
-Start SGLang TP=2 with FlashInfer AllReduce fusion enabled. Compare:
+Start SGLang at the Task 13 computed `TP=N` with FlashInfer AllReduce fusion
+enabled. Compare:
 
 - fusion disabled baseline;
 - existing AR+RMSNorm only;
 - new AR+RMSNorm+static-FP8.
 
 Validate deterministic prompts/output equivalence within expected FP8 variation, CUDA Graph capture/replay, warmup, decode stability, and memory. Report TTFT, ITL, throughput, and kernel-level latency; do not cherry-pick only one favorable metric.
+
+If `N > 2`, make the rental sequence explicit. Either rent N GPUs once and use
+two ranks/GPUs for the kernel microbenchmark before the TP=N model run, or do
+two short stages (2 GPUs for kernel validation, shut them down, then N GPUs for
+the model). Never keep an idle first instance running while the second is used.
 
 **Step 5: Stop rental promptly**
 
@@ -1271,7 +1277,7 @@ Prepare a concise issue comment describing exact Step 3 scope and a PR body cont
 - why pattern 2 vs pattern 4 is required;
 - static scale and tuple contracts;
 - collective-safety/fallback behavior;
-- unit, TP=2, graph, and checkpoint validation commands/results;
+- TP=2 kernel/unit/graph and TP=N exact-checkpoint validation commands/results;
 - measured performance table and limitations.
 
 Do not comment, push, or open a PR without the user's explicit approval, because each mutates remote state.
@@ -1282,4 +1288,9 @@ Use `superpowers:requesting-code-review`. Resolve Blocker/Important findings wit
 
 ## Resume-safe completion criteria
 
-The item may be described as “implemented” only when local code and focused tests pass. It may be described as “validated on 2×H20/H100/H200” only after Task 14. It may be described as an “SGLang PR” only after a real PR URL exists. Until merged, the resume must say “submitted” or “open-source contribution under review,” never imply upstream adoption.
+The item may be described as “implemented” only when local code and focused
+tests pass. After Task 14, distinguish “kernel/collective path validated at
+TP=2 on 2×{GPU}” from “exact checkpoint validated at TP=N on N×{GPU}”; include
+only configurations actually run. It may be described as an “SGLang PR” only
+after a real PR URL exists. Until merged, the resume must say “submitted” or
+“open-source contribution under review,” never imply upstream adoption.
