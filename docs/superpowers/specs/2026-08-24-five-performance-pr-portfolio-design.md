@@ -34,6 +34,15 @@ This provides the strongest single artifact but creates schedule risk if FlashIn
 
 Implement one high-value task at a time. Before starting each task, refresh the issue, open-PR search, and current code. Keep a ranked fallback for every slot. This is the selected approach.
 
+The five slots do not have equal readiness. PR 1 is implementation-ready. PR 2 has a defined producer and consumer but still requires an isolated kernel spike. PR 3 and PR 4 begin as profiling spikes and become PRs only after a concrete hot path clears their promotion gate. PR 5 is a concrete model-adoption task, but still requires a baseline showing that prefill is material for the selected workload.
+
+Ranked fallbacks, rechecked before each branch starts:
+
+1. another unclaimed #31504 producer site with measured H20 headroom;
+2. Qwen3-TTS mixed sampled/argmax batch graph retention from #1418;
+3. `dots.tts` or AuDar-TTS prefill graph adoption from #1357;
+4. a newly qualified H20-compatible target from the Omni KDA roadmap #1650.
+
 ## Portfolio
 
 ### PR 1 — FlashInfer AllReduce + RMSNorm + static FP8 quantization
@@ -55,15 +64,17 @@ Scope:
 
 - Add a FlashInfer wrapper for all-reduce + residual + RMSNorm + per-tensor FP8 quantization.
 - Reuse the existing static-FP8 eligibility check; do not duplicate quantization-scheme detection.
-- Pass only the necessary downstream-linear/scale information through the layer-normalization and communicator boundary.
-- Return the same pre-quantized tuple contract used by the norm-level fusion.
-- Wire a single-consumer QKV/GDN input-projection site first. Do not quantize the post-attention norm whose output also feeds BF16 router/routed-expert consumers.
+- Generalize the existing fused-AR-quant configuration and tuple handoff instead of creating a second communicator mechanism.
+- Reuse `_fp8_static_input_scale` for consumer eligibility and static scale extraction.
+- Use `kARResidualRMSNormFP8Quant` for a full-attention QKV projection whose normalized activation has only the FP8 consumer.
+- For Qwen3.5 GDN, which consumes the same normalized activation through FP8 `in_proj_qkvz` and BF16 `in_proj_ba`, use and validate the dual-output `kARResidualRMSNormOutFP8Quant` pattern. Preserve the BF16 norm output and pass the FP8 tuple only to the eligible projection.
+- Do not quantize the post-attention norm whose output also feeds router/routed-expert consumers; that broader dual-output site remains out of scope.
 - Preserve eager and non-quantizing all-reduce fallbacks.
 
 Non-goals:
 
 - Dynamic or block-wise FP8 activation quantization.
-- MXFP8, Marlin, ROCm/AITER, multi-node MNNVL qualification, SiluAndMul fusion, or dual-output post-attention norm fusion.
+- MXFP8, Marlin, ROCm/AITER, multi-node MNNVL qualification, SiluAndMul fusion, or dual-output post-attention/router norm fusion.
 - Enabling the feature for a model without proving the producer has exactly the intended FP8 consumer contract.
 
 Expected code surfaces:
@@ -76,13 +87,31 @@ Expected code surfaces:
 - focused layernorm/communicator/model unit tests
 - a small two-rank benchmark or extension of the existing communication benchmark
 
+Required call chain:
+
+1. Model construction supplies the exact eligible projection(s), not an architecture name or a Boolean guessed from checkpoint metadata.
+2. `LayerCommunicator` reuses its existing `enable_fused_ar_quant` and `fused_ar_quant_keep_bf16` policy, extended with static per-tensor CUDA mode.
+3. The layernorm helper resolves eligibility through `_fp8_static_input_scale` and selects quant-only or norm-plus-quant output.
+4. The FlashInfer wrapper preallocates residual, optional norm, and FP8 outputs, then calls the exact pattern with a device-resident `scale_factor`.
+5. The downstream FP8 linear consumes `(fp8, scale, original_dtype)`; a GDN BF16 consumer receives the separately materialized norm output.
+
 Correctness contract:
 
 - Residual output matches the non-quantizing fused path within the existing norm tolerance.
-- Dequantized FP8 norm output matches the BF16/FP16 reference within FP8 tolerance.
+- Fused quant output matches `static_quant_fp8(nonquant_norm, input_scale)` under the same scale convention, not merely a dequantized cosine check.
+- Standard RMSNorm and Gemma/Qwen3.5 `weight_bias=1.0` semantics are tested separately.
 - Downstream linear output dtype remains the original activation dtype.
-- Unsupported scale shape, quantization method, topology, world size, shape, dtype, or FlashInfer version follows the existing path without changing output type.
-- CUDA Graph capture/replay produces stable outputs and does not allocate dynamic buffers in replay.
+- FP16/BF16, scale dtype/device/contiguity, quant-only tuples, and BF16-plus-FP8 dual output are covered.
+- Downstream GEMM and a fixed model-level output/logit gate agree with the baseline within the declared FP8 tolerance.
+- CUDA Graph capture followed by repeated replay with changing inputs produces fresh, stable outputs and does not allocate dynamic buffers in replay.
+
+Collective-safe eligibility and fallback:
+
+- Exact FlashInfer enum and call-signature support for `quant_out`, `scale_factor`, and the selected pattern is probed before any collective.
+- Backend, workspace capacity, process-group identity, dtype, shape, scale, and tuple-mode decisions are derived from rank-invariant metadata. Availability failures discovered during initialization are synchronized across the participating ranks.
+- A rank may use the existing non-quantizing fused path only when every rank makes the same pre-collective decision.
+- Once the quantizing collective is launched, errors fail fast. There is no catch-and-fallback path after one rank may have entered the kernel.
+- Two-rank tests cover both the normal path and a deliberately unavailable capability path without collective mismatch.
 
 Performance contract:
 
@@ -90,61 +119,63 @@ Performance contract:
 - Isolated two-rank latency uses interleaved A/B rounds after warm-up and reports median and tail distribution.
 - End-to-end H20 TP=2 decode compares identical model, workload, process, clocks, and software SHA. A gain is claimed only if it clears the measured A/A noise band.
 
-### PR 2 — Whisper compiled/fused encoder path
+Before renting a GPU, the benchmark checkpoint and revision must be fixed and checked from metadata or a dry-run memory estimate. It must fit `2 x H20 96GB`, use an allowlisted architecture, contain a wired static per-tensor FP8 projection, enable FlashInfer all-reduce under TP=2 with DP attention off and `moe_a2a_backend=none`, and show the target standalone quant kernel in a baseline trace. If no such checkpoint is available, PR 1 remains a correctness/integration contribution and a different H20-compatible target takes the performance-claim slot.
+
+### PR 2 — Gated RMSNorm + static FP8 quantization
+
+Repository: `sgl-project/sglang`
+
+Upstream reference: issue #31504, Step 2
+
+Goal: fuse static per-tensor FP8 quantization into the block-internal gated RMSNorm that feeds the GDN output projection. Unlike PR 1, this is a local producer-kernel optimization and applies even when no tensor-parallel all-reduce fusion is active.
+
+This is a separate PR because it changes a different kernel and producer contract, has different topology coverage, and can be evaluated independently. It must reuse the pre-quantized linear tuple contract from the landed norm fusion. The initial spike must prove that the gated norm is a material H20 hot path and that an extra FP8 output beats the current gated norm plus standalone quant sequence. If it does not clear isolated A/A noise, the slot falls back rather than publishing a neutral custom kernel.
+
+Tests cover gate-before/after-norm semantics, head/group shapes, FP16/BF16, residual absence, FP8 saturation, downstream output parity, and CUDA Graph replay. Benchmarks report isolated kernel latency, removed launches, memory traffic where counters are available, and end-to-end decode.
+
+### PR 3 — Whisper compiled/fused encoder profiling spike
 
 Repository: `sgl-project/sglang-omni`
 
 Upstream reference: ASR roadmap #1396, W-PR6
 
-Goal: qualify and implement a compiled/fused Whisper encoder path on top of the landed bucketed encoder CUDA Graph work.
+Goal: qualify one concrete compiled or fused Whisper encoder change on top of the landed bucketed encoder CUDA Graph work.
 
-Scope is gated by profiling. First establish encoder-only and end-to-end baselines for the graph-enabled path; then compile stable fixed/bucketed encoder shapes or fuse a proven hot projection/pointwise chain. The PR must retain eager fallback for unqualified shapes. It must not assume that `torch.compile` is beneficial merely because it reduces Python code.
+This slot begins as a spike, not as an implementation-ready PR. First profile current main together with the effects already covered by open Whisper PRs #1510 and #1589. Then choose exactly one of: compile then capture, compile with encoder graph disabled, or a single measured kernel fusion. The promotion note must name the function, stable input domain, selected compile/graph ordering, eager fallback, and isolated headroom. If no option clears the noise gate, use a ranked fallback.
 
-Tests cover compile selection, bucket hits/misses, eager fallback, output parity, and graph/compile mutual-exclusion rules. Benchmark gates include WER/CER, encoder latency, requests/s, mean/p95 latency, compile warm-up cost, and peak memory.
+Tests cover the selected ordering, bucket hits/misses, eager fallback, output parity, and graph/compile lifetime. Benchmark gates include WER/CER, encoder latency, requests/s, mean/p95 latency, compile warm-up/capture cost, and peak memory.
 
-### PR 3 — Qwen3-TTS streaming-vocoder event-based completion and pinned staging
-
-Repository: `sgl-project/sglang-omni`
-
-Upstream reference: issue #1418, section 6
-
-Goal: remove the per-decode `stream.synchronize()` and pageable host-to-device upload from `streaming_vocoder.py` by introducing pinned staging plus an explicit launch/resolve event lifecycle.
-
-The design must preserve bad-code validation, request ordering, cancellation, state ownership, and final flush. Launch may enqueue work, but waveform consumption and error reporting may occur only after the corresponding event resolves. Batches cannot reuse staging storage while work is in flight.
-
-Tests cover pending/completed states, staging-slot reuse, cancellation, bad rows, final flush, and deterministic mode. Benchmarks report H2D latency, host blocked time, TTFA, audio seconds/s, and latency at c1/c8/c16.
-
-### PR 4 — Qwen3-TTS follow-up-window CUDA Graphs
+### PR 4 — Qwen3-TTS reference-encode service batching
 
 Repository: `sgl-project/sglang-omni`
 
 Upstream reference: issue #1418, section 6
 
-Goal: graph stable follow-up vocoder window shapes instead of graphing only the initial window.
+Goal: add service-level batching for Qwen3-TTS reference encoding only if a cold unique-voice workload shows material encoder headroom.
 
-Use a bounded key consisting of the semantically required dimensions, such as batch size and valid frame count. Record hit, miss, capture, and eager-fallback counters. Do not right-pad across the convolution receptive field unless a valid-region argument and bit-parity test prove it safe. Limit graph count and memory explicitly.
+Open PR #1625 already implements uploaded-voice single-flight and must not be duplicated. This candidate starts from current main plus the eventual #1625 outcome, profiles unique-key cold requests, and implements `can_encode_batch`/batched hook behavior only when padding, masking, output splitting, cache insertion, cancellation, and failure isolation can be made equivalent to independent encodes.
 
-Tests cover keying, capture reuse, bounded eviction/disable policy, eager fallback, exact emitted waveform slices, and interaction with the PR 3 launch/resolve lifecycle. Benchmarks report hit rate, graph memory, capture time, steady-state vocoder latency, and end-to-end streaming metrics.
+Tests cover variable reference lengths, batch formation, output-to-request mapping, per-item failure, cancellation, cache insertion, and batched-vs-independent parity. Benchmarks report encoder invocation count, achieved batch size, cold unique-voice throughput, mean/p95 latency, and memory. If profiling shows batching cannot amortize the work, this slot falls back.
 
-### PR 5 — Qwen3-TTS uploaded-reference single-flight and service batching
+### PR 5 — MOSS-TTS-Local prefill CUDA Graph adoption
 
 Repository: `sgl-project/sglang-omni`
 
-Upstream reference: issue #1418, section 6
+Upstream reference: issue #1357 backlog
 
-Goal: ensure concurrent cold requests for the same uploaded voice perform one reference encode, and add service-level batching only where the codec/reference hook can prove equivalent batched semantics.
+Goal: adopt the shared SGLang-Omni prefill graph policy for MOSS-TTS-Local without duplicating the upstream graph runner.
 
-The existing ad-hoc reference path already uses `ReferenceEncodeService`; the uploaded-voice cache-miss branch currently performs direct encoding. First unify cache misses behind keyed single-flight. Batch encoding is a second phase of the same PR only if profiling shows additional value and input padding/masking is correct; otherwise the PR remains a focused single-flight performance fix.
+Before implementation, verify that no open PR has claimed this backlog item and establish that prefill contributes enough wall time to justify graph capture. Reuse `OmniPrefillInputs` and the centralized bucket/cap policy available on then-current main. Add only model-specific static-input preparation, output slicing, capability declaration, and explicit eager fallback required by MOSS-TTS-Local.
 
-Tests cover N concurrent identical misses, different-key independence, leader failure propagation, retry after failure, cache insertion, cancellation, and batch parity. Benchmarks report encoder invocation count, cold-start wall latency, throughput under repeated/shared and unique voices, and cache memory.
+Tests follow #1357's adapter acceptance contract: eligible real request, A-B-A stale-state protection, replay plus eager fallback, deterministic output/quality parity, and capture-memory accounting. Benchmarks report graph hit rate, capture/startup cost, VRAM, prefill latency, TTFA, and end-to-end throughput at c1 and loaded concurrency. If prefill is not material, replace this slot rather than defaulting on a neutral graph.
 
 ## Execution order and dependency rules
 
-1. Implement PR 1 locally and run CPU/mock tests before renting a GPU.
-2. Rent one two-card H20 NVLink instance only when PR 1 reaches the GPU-validation gate.
-3. In parallel with benchmark collection only at the workflow level, prepare PR 2's profile harness; do not begin a second implementation branch until PR 1 has a reviewable commit.
-4. Implement PR 3 before PR 4 because the follow-up graph path must use the final launch/resolve ownership model.
-5. PR 5 is independent of PR 3/4 and is the fallback if Whisper compile provides no measurable benefit.
+1. Coordinate ownership for #31504 Step 3 before substantive coding, then implement PR 1 locally and run CPU/mock tests before renting a GPU. Open a draft PR early once the local contract is credible.
+2. Rent one two-card H20 NVLink instance only when PR 1 reaches the GPU-validation gate and the checkpoint gate is satisfied.
+3. Do not begin PR 2 until PR 1 has a reviewable commit; reuse shared tuple infrastructure but keep the gated-norm kernel and evidence independent.
+4. Run PR 3 and PR 4 qualification profiles before treating them as PR slots. A failed promotion gate selects a fallback.
+5. PR 5 may proceed independently after refreshing #1357 ownership and dependencies.
 
 Each feature PR branches directly from the then-current upstream `main`. Planning commits are never included in a feature PR.
 
