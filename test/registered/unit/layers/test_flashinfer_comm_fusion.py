@@ -268,6 +268,66 @@ class TestFlashInferAllReduceFp8BenchmarkContract(unittest.TestCase):
                 benchmark.CASE_NAMES[2],
             )
 
+    def test_correctness_accepts_adjacent_e4m3_bucket_within_ulp_budget(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+        self.assertTrue(
+            hasattr(benchmark, "_finite_e4m3_values"),
+            "benchmark must derive the actual finite E4M3 lattice",
+        )
+        lattice = benchmark._finite_e4m3_values(torch, torch.device("cpu"))
+        self.assertEqual(lattice.numel(), 253)
+        self.assertTrue(torch.isfinite(lattice).all())
+        self.assertTrue(torch.all(lattice[1:] > lattice[:-1]))
+
+        baseline_value = torch.tensor(1.0)
+        baseline_index = torch.searchsorted(lattice, baseline_value).item()
+        baseline_quant = baseline_value.to(torch.float8_e4m3fn).reshape(1, 1)
+        actual_quant = lattice[baseline_index + 1].to(
+            torch.float8_e4m3fn
+        ).reshape(1, 1)
+        residual = torch.zeros((1, 1), dtype=torch.float32)
+        empty_norm = torch.empty((0,), dtype=torch.float32)
+
+        benchmark._assert_case_matches_baseline(
+            types.SimpleNamespace(torch=torch),
+            (actual_quant, residual.clone(), empty_norm.clone()),
+            (baseline_quant, residual, empty_norm),
+            torch.float32,
+            torch.tensor(0.02, dtype=torch.float32),
+            benchmark.CASE_NAMES[2],
+        )
+
+    def test_highly_saturated_baseline_quantization_is_rejected(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+        self.assertTrue(
+            hasattr(benchmark, "_local_fp8_saturation_error"),
+            "benchmark must validate measured baseline saturation",
+        )
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        saturated = torch.cat(
+            (torch.zeros(98), torch.full((2,), fp8_max))
+        ).to(torch.float8_e4m3fn)
+
+        error = benchmark._local_fp8_saturation_error(
+            torch, saturated, max_saturation_rate=0.01
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("2.00%", error)
+
+    def test_saturation_failure_is_synchronized_before_raise(self):
+        benchmark = _load_flashinfer_fp8_benchmark_module()
+        self.assertTrue(
+            hasattr(benchmark, "_validate_baseline_quantization"),
+            "benchmark must synchronize saturation validity across ranks",
+        )
+        source = inspect.getsource(benchmark._validate_baseline_quantization)
+        self.assertLess(
+            source.index("_all_ranks_true"), source.index("raise RuntimeError")
+        )
+        self.assertLess(
+            source.index("_gather_error"), source.index("raise RuntimeError")
+        )
+
     def test_launch_rejects_scale_above_representative_range(self):
         benchmark = _load_flashinfer_fp8_benchmark_module()
         fake_torch = types.SimpleNamespace(
@@ -280,7 +340,7 @@ class TestFlashInferAllReduceFp8BenchmarkContract(unittest.TestCase):
 
         launch_source = inspect.getsource(benchmark._validate_launch)
         self.assertNotIn("runtime.torch", launch_source)
-        with self.assertRaisesRegex(ValueError, "1e-4.*0.1"):
+        with self.assertRaisesRegex(ValueError, "0.1"):
             benchmark._validate_launch(fake_torch, args, 2, 0)
 
 

@@ -34,6 +34,8 @@ CASE_NAMES = (
     "flashinfer_ar_rmsnorm_static_fp8",
     "flashinfer_ar_rmsnorm_static_fp8_bf16",
 )
+MAX_BASELINE_SATURATION_RATE = 0.01
+MAX_FP8_ULPS = 2
 
 METADATA_FIELDS = (
     "timestamp_utc",
@@ -194,7 +196,10 @@ def build_parser():
         "--scale",
         type=float,
         default=0.02,
-        help="static FP8 activation scale in the representative range [1e-4, 0.1]",
+        help=(
+            "positive static FP8 activation scale <= 0.1; baseline "
+            "saturation is measured from the quantized output"
+        ),
     )
     parser.add_argument(
         "--json-out",
@@ -398,7 +403,7 @@ def _prepare_state(state, base_input, base_residual):
     state.residual.copy_(base_residual)
 
 
-def _tolerances(dtype, scale):
+def _tolerances(dtype):
     if str(dtype).endswith("float32"):
         residual = {"rtol": 2e-4, "atol": 2e-4}
         norm = {"rtol": 3e-4, "atol": 3e-4}
@@ -408,14 +413,62 @@ def _tolerances(dtype, scale):
     else:
         residual = {"rtol": 5e-3, "atol": 5e-3}
         norm = {"rtol": 1e-2, "atol": 1e-2}
-    dequant = {"rtol": 0.0, "atol": min(2.0 * scale, 0.2)}
-    return residual, norm, dequant
+    return residual, norm
+
+
+def _finite_e4m3_values(torch, device):
+    """Return the sorted unique finite E4M3 lattice on ``device``."""
+    bit_patterns = torch.arange(256, dtype=torch.uint8, device=device)
+    values = bit_patterns.view(torch.float8_e4m3fn).float()
+    return torch.unique(values[torch.isfinite(values)], sorted=True)
+
+
+def _fp8_ulp_dequant_allowance(torch, baseline_quant, scale, max_ulps=MAX_FP8_ULPS):
+    baseline_values = baseline_quant.float()
+    lattice = _finite_e4m3_values(torch, baseline_quant.device)
+    lower_indices = torch.searchsorted(
+        lattice, baseline_values, right=False
+    ).sub_(1).clamp_(min=0)
+    upper_indices = torch.searchsorted(
+        lattice, baseline_values, right=True
+    ).clamp_(max=lattice.numel() - 1)
+    lower_steps = baseline_values - lattice[lower_indices]
+    upper_steps = lattice[upper_indices] - baseline_values
+    local_ulp = torch.maximum(lower_steps, upper_steps)
+    return local_ulp * max_ulps * scale
+
+
+def _local_fp8_saturation_error(
+    torch,
+    baseline_quant,
+    max_saturation_rate=MAX_BASELINE_SATURATION_RATE,
+):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    saturation_rate = (
+        baseline_quant.float().abs().eq(fp8_max).float().mean()
+    )
+    if bool(saturation_rate > max_saturation_rate):
+        return (
+            f"baseline FP8 saturation rate {saturation_rate.item():.2%} "
+            f"exceeds {max_saturation_rate:.2%}; choose a larger --scale"
+        )
+    return None
+
+
+def _validate_baseline_quantization(runtime, baseline_quant, device):
+    local_error = _local_fp8_saturation_error(runtime.torch, baseline_quant)
+    all_representative = _all_ranks_true(runtime, local_error is None, device)
+    if not all_representative:
+        errors = _gather_error(runtime, local_error)
+        raise RuntimeError(
+            "Benchmark scale is not representative on every rank: " + errors
+        )
 
 
 def _assert_case_matches_baseline(runtime, actual, baseline, dtype, scale, case_name):
     actual_quant, actual_residual, actual_norm = actual
     baseline_quant, baseline_residual, baseline_norm = baseline
-    residual_tol, norm_tol, dequant_tol = _tolerances(dtype, float(scale.item()))
+    residual_tol, norm_tol = _tolerances(dtype)
     if actual_quant.dtype != baseline_quant.dtype:
         raise AssertionError(
             f"{case_name} quant dtype mismatch: {actual_quant.dtype} != "
@@ -427,12 +480,22 @@ def _assert_case_matches_baseline(runtime, actual, baseline, dtype, scale, case_
         msg=lambda message: f"{case_name} residual mismatch: {message}",
         **residual_tol,
     )
-    runtime.torch.testing.assert_close(
-        actual_quant.float() * scale,
-        baseline_quant.float() * scale,
-        msg=lambda message: f"{case_name} dequantized FP8 mismatch: {message}",
-        **dequant_tol,
+    dequant_difference = (
+        actual_quant.float() - baseline_quant.float()
+    ).abs() * scale
+    allowed_difference = _fp8_ulp_dequant_allowance(
+        runtime.torch, baseline_quant, scale
     )
+    violations = dequant_difference > allowed_difference
+    if bool(violations.any()):
+        excess = dequant_difference - allowed_difference
+        violation_index = excess.reshape(-1).argmax()
+        max_difference = dequant_difference.reshape(-1)[violation_index].item()
+        allowed_at_max = allowed_difference.reshape(-1)[violation_index].item()
+        raise AssertionError(
+            f"{case_name} dequantized FP8 exceeds {MAX_FP8_ULPS} local ULPs: "
+            f"max_diff={max_difference:.8g}, allowed={allowed_at_max:.8g}"
+        )
     if case_name in (CASE_NAMES[1], CASE_NAMES[3]):
         runtime.torch.testing.assert_close(
             actual_norm,
@@ -458,6 +521,7 @@ def _check_eager_correctness(runtime, states, base_input, base_residual, dtype, 
     _prepare_state(baseline_state, base_input, base_residual)
     baseline = baseline_state.call()
     runtime.torch.cuda.synchronize(device)
+    _validate_baseline_quantization(runtime, baseline[0], device)
     outcomes[CASE_NAMES[0]] = {"available": True, "correctness": True, "error": ""}
 
     for case_name in CASE_NAMES[1:]:
@@ -843,10 +907,11 @@ def _validate_launch(torch, args, world_size, local_rank):
         )
     if local_rank not in (0, 1):
         raise RuntimeError(f"LOCAL_RANK must be 0 or 1; got {local_rank}")
-    if not math.isfinite(args.scale) or not 1e-4 <= args.scale <= 0.1:
+    if not math.isfinite(args.scale) or not 0 < args.scale <= 0.1:
         raise ValueError(
-            "--scale must be within 1e-4 and 0.1 to keep representative "
-            "activation quantization error bounded without trivial saturation"
+            "--scale must be positive and <= 0.1; the upper bound avoids "
+            "degenerate near-zero FP8 outputs, while baseline saturation is "
+            "measured separately"
         )
     if args.eps <= 0 or not math.isfinite(args.eps):
         raise ValueError("--eps must be finite and positive")
