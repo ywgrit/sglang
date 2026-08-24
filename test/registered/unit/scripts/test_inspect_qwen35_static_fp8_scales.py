@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,6 +95,19 @@ class _Process:
         return self.exitcode is None and not self.terminated
 
 
+class _StubbornProcess(_Process):
+    def __init__(self):
+        super().__init__(exitcode=None)
+        self.killed = False
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        self.killed = True
+        self.terminated = True
+
+
 class TestQwen35ScaleInspector(unittest.TestCase):
     def test_rejects_scalar_scale_on_ineligible_quant_method(self):
         eligible = object()
@@ -158,6 +173,48 @@ class TestQwen35ScaleInspector(unittest.TestCase):
 
         self.assertFalse(result)
         self.assertTrue(blocked.terminated)
+
+    def test_failed_rank_kills_worker_that_ignores_terminate(self):
+        failed = _Process(exitcode=1)
+        stubborn = _StubbornProcess()
+
+        result = INSPECTOR.wait_for_processes(
+            [stubborn, failed], timeout_seconds=60, poll_interval=0
+        )
+
+        self.assertFalse(result)
+        self.assertTrue(stubborn.killed)
+
+    def test_output_directory_must_be_fresh(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "run"
+            INSPECTOR.prepare_output_dir(output)
+            (output / "rank-0.json").write_text('{}\n')
+            with self.assertRaises(FileExistsError):
+                INSPECTOR.prepare_output_dir(output)
+
+    def test_summary_cannot_be_green_after_worker_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            for rank in range(2):
+                (output / f"rank-{rank}.json").write_text(
+                    json.dumps({"rank": rank, "valid": True}) + "\n"
+                )
+
+            summary = INSPECTOR._aggregate(
+                output, tp_size=2, workers_succeeded=False
+            )
+
+            self.assertFalse(summary["valid"])
+            self.assertFalse(summary["workers_succeeded"])
+
+    def test_runbook_disables_auto_fusion_and_preserves_pipeline_status(self):
+        runbook = (
+            REPO_ROOT
+            / "docs/superpowers/runbooks/2026-08-25-pr1-h20-validation.md"
+        ).read_text()
+        self.assertIn("--enforce-disable-flashinfer-allreduce-fusion", runbook)
+        self.assertIn("set -o pipefail", runbook)
 
 
 if __name__ == "__main__":
