@@ -27,11 +27,13 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     device_context,
     is_cpu,
+    is_cuda,
     is_npu,
     next_power_of_2,
 )
 
 _is_npu = is_npu()
+_is_cuda = is_cuda()
 _use_cpu = is_cpu() and cpu_has_amx_support()
 
 # Maximum rows per Triton block for layernorm gated kernel
@@ -78,6 +80,7 @@ def _layer_norm_fwd_1pass_kernel(
     W,  # pointer to the weights
     B,  # pointer to the biases
     Z,  # pointer to the other branch
+    QuantScale,  # pointer to the static per-tensor FP8 scale
     Mean,  # pointer to the mean
     Rstd,  # pointer to the 1/std
     stride_x_row,  # how much to increase the pointer when moving by 1 row
@@ -93,6 +96,7 @@ def _layer_norm_fwd_1pass_kernel(
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    QUANTIZE_STATIC_FP8: tl.constexpr,
     USE_GDC: tl.constexpr = False,
 ):
     if USE_GDC:
@@ -176,6 +180,13 @@ def _layer_norm_fwd_1pass_kernel(
         elif ACTIVATION == "sigmoid":
             y *= tl.sigmoid(z)
 
+    if QUANTIZE_STATIC_FP8:
+        # Match the split path exactly: gated RMSNorm first stores to the
+        # activation dtype, then static_quant_fp8 reloads that rounded value.
+        y = y.to(X.dtype.element_ty).to(tl.float32)
+        quant_scale = tl.load(QuantScale).to(tl.float32)
+        y = tl.clamp(y / quant_scale, -448.0, 448.0).to(Y.dtype.element_ty)
+
     # Write output
     tl.store(Y_base, y, mask=mask)
 
@@ -216,6 +227,7 @@ def _layer_norm_fwd(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    quant_scale=None,
 ):
     M, N = x.shape
     if group_size is None:
@@ -231,9 +243,27 @@ def _layer_norm_fwd(
     if bias is not None:
         assert bias.stride(-1) == 1
         assert bias.shape == (N,)
+    if quant_scale is not None:
+        if not _is_cuda or x.device.type != "cuda":
+            raise ValueError("static FP8 gated RMSNorm quantization requires CUDA")
+        if quant_scale.numel() != 1:
+            raise ValueError("quant_scale must contain exactly one element")
+        if quant_scale.dtype != torch.float32:
+            raise ValueError("quant_scale must have dtype torch.float32")
+        if quant_scale.device != x.device:
+            raise ValueError("quant_scale must be on the same device as x")
+        if not quant_scale.is_contiguous() or (
+            quant_scale.ndim == 1 and quant_scale.stride(0) != 1
+        ):
+            raise ValueError("quant_scale must be contiguous")
+        if out is not None:
+            raise ValueError("out is not supported with static FP8 quantization")
+
     # allocate output
     if out is not None:
         assert out.shape == x.shape
+    elif quant_scale is not None:
+        out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     else:
         out = torch.empty_like(x)
     assert out.stride(-1) == 1
@@ -276,6 +306,7 @@ def _layer_norm_fwd(
             weight,
             bias,
             z,
+            quant_scale,
             mean,
             rstd,
             x.stride(0),
@@ -290,6 +321,7 @@ def _layer_norm_fwd(
             HAS_Z=z is not None,
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
+            QUANTIZE_STATIC_FP8=quant_scale is not None,
             num_warps=num_warps,
             ACTIVATION=activation,
             **pdl_kwargs,
@@ -312,8 +344,12 @@ def rms_norm_gated(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    quant_scale=None,
 ):
     """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+
+    if quant_scale is not None and not _is_cuda:
+        raise ValueError("static FP8 gated RMSNorm quantization requires CUDA")
 
     x_shape_og = x.shape
     # reshape input data into 2D tensor
@@ -330,16 +366,23 @@ def rms_norm_gated(
         bias = bias.contiguous()
     if _is_npu:
         assert activation == "swish", "NPU only supports swish activation"
-    y, mean, rstd = _layer_norm_fwd(
-        x,
-        weight,
-        bias,
-        eps,
+    forward_kwargs = dict(
         z=z,
         group_size=group_size,
         norm_before_gate=norm_before_gate,
         is_rms_norm=is_rms_norm,
         activation=activation,
+    )
+    # The NPU implementation does not expose this CUDA-only extension. Avoid
+    # changing its call signature for the existing, unquantized path.
+    if quant_scale is not None:
+        forward_kwargs["quant_scale"] = quant_scale
+    y, mean, rstd = _layer_norm_fwd(
+        x,
+        weight,
+        bias,
+        eps,
+        **forward_kwargs,
     )
     return y.reshape(x_shape_og)
 
@@ -358,6 +401,7 @@ class LayerNormFn(torch.autograd.Function):
         norm_before_gate=True,
         is_rms_norm=False,
         activation: str = "swish",
+        quant_scale=None,
     ):
         return rms_norm_gated(
             x=x,
@@ -369,6 +413,7 @@ class LayerNormFn(torch.autograd.Function):
             norm_before_gate=norm_before_gate,
             is_rms_norm=is_rms_norm,
             activation=activation,
+            quant_scale=quant_scale,
         )
 
 
@@ -382,9 +427,19 @@ def layernorm_fn(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    quant_scale=None,
 ):
     return LayerNormFn.apply(
-        x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm, activation
+        x,
+        weight,
+        bias,
+        z,
+        eps,
+        group_size,
+        norm_before_gate,
+        is_rms_norm,
+        activation,
+        quant_scale,
     )
 
 
@@ -416,7 +471,7 @@ class LayerNorm(torch.nn.Module):
         torch.nn.init.ones_(self.weight)
         torch.nn.init.zeros_(self.bias)
 
-    def forward(self, x, z=None):
+    def forward(self, x, z=None, quant_scale=None):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
         return layernorm_fn(
             x,
@@ -427,6 +482,7 @@ class LayerNorm(torch.nn.Module):
             eps=self.eps,
             norm_before_gate=self.norm_before_gate,
             is_rms_norm=False,
+            quant_scale=quant_scale,
         )
 
 
@@ -458,9 +514,11 @@ class RMSNorm(torch.nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
-    def forward(self, x, z=None):
+    def forward(self, x, z=None, quant_scale=None):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
         if _use_cpu:
+            if quant_scale is not None:
+                raise ValueError("static FP8 gated RMSNorm quantization requires CUDA")
             assert (
                 self.norm_before_gate
                 and self.group_size is None
@@ -480,4 +538,5 @@ class RMSNorm(torch.nn.Module):
                 norm_before_gate=self.norm_before_gate,
                 is_rms_norm=True,
                 activation=self.activation,
+                quant_scale=quant_scale,
             )

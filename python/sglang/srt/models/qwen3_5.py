@@ -48,7 +48,7 @@ from sglang.srt.layers.dp_attention import (
 )
 
 # Layers - Others
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.layernorm import GemmaRMSNorm, _fp8_static_input_scale
 
 # Layers - Linear
 from sglang.srt.layers.linear import (
@@ -255,6 +255,34 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
+
+
+def _prepare_gated_rmsnorm_out_proj_input(
+    norm: nn.Module,
+    out_proj: nn.Module,
+    core_attn_out: torch.Tensor,
+    gate: torch.Tensor,
+    gate_shape: torch.Size | tuple[int, ...],
+):
+    """Run gated RMSNorm and form the optional pre-quantized linear input."""
+    original_dtype = core_attn_out.dtype
+    quant_scale = None
+    if (
+        _is_cuda
+        and os.environ.get("SGLANG_DISABLE_GATED_RMSNORM_FP8_QUANT", "0") != "1"
+    ):
+        quant_scale = _fp8_static_input_scale(out_proj)
+
+    if quant_scale is None:
+        normed = norm(core_attn_out, gate)
+    else:
+        normed = norm(core_attn_out, gate, quant_scale=quant_scale)
+
+    normed = normed.reshape(gate_shape)
+    normed = normed.reshape(*normed.shape[:-2], -1)
+    if quant_scale is None:
+        return normed
+    return normed, quant_scale, original_dtype
 
 
 if _is_npu:
@@ -698,9 +726,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        core_attn_out = _prepare_gated_rmsnorm_out_proj_input(
+            self.norm, self.out_proj, core_attn_out, z, z_shape_og
+        )
 
         output, _ = self.out_proj(core_attn_out)
         return output
@@ -778,11 +806,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(
-            *core_attn_out.shape[:-2],
-            core_attn_out.shape[-2] * core_attn_out.shape[-1],
+        core_attn_out = _prepare_gated_rmsnorm_out_proj_input(
+            self.norm, self.out_proj, core_attn_out, z, z_shape_og
         )
 
         output, _ = self.out_proj(core_attn_out)
