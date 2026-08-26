@@ -28,6 +28,8 @@ class _FakeFlashInferComm:
     class AllReduceFusionPattern:
         kAllReduce = object()
         kARResidualRMSNorm = object()
+        kARResidualRMSNormFP8Quant = object()
+        kARResidualRMSNormOutFP8Quant = object()
 
     def __init__(self):
         self.calls = []
@@ -47,6 +49,8 @@ class _FakeFlashInferComm:
         output=None,
         residual_out=None,
         norm_out=None,
+        quant_out=None,
+        scale_factor=None,
         residual_in=None,
         rms_gamma=None,
         rms_eps=None,
@@ -59,9 +63,6 @@ class _FakeFlashInferComm:
             output.copy_(allreduced)
             return output
 
-        if pattern is not self.AllReduceFusionPattern.kARResidualRMSNorm:
-            raise ValueError(f"Unexpected pattern: {pattern}")
-
         allreduced = input * workspace.world_size
         expected_residual = allreduced + residual_in
         variance = expected_residual.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
@@ -71,7 +72,17 @@ class _FakeFlashInferComm:
             * rms_gamma.to(torch.float32)
         ).to(input.dtype)
         residual_out.copy_(expected_residual)
-        norm_out.copy_(expected_norm)
+        if pattern is self.AllReduceFusionPattern.kARResidualRMSNorm:
+            norm_out.copy_(expected_norm)
+        elif pattern in (
+            self.AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
+            self.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
+        ):
+            quant_out.copy_((expected_norm / scale_factor).to(quant_out.dtype))
+            if norm_out is not None:
+                norm_out.copy_(expected_norm)
+        else:
+            raise ValueError(f"Unexpected pattern: {pattern}")
 
 
 def _torch_allreduce_residual_rmsnorm_baseline(
@@ -248,6 +259,62 @@ class TestFlashInferCommFusion(CustomTestCase):
             else:
                 buffers[manager_key] = original_manager
             fusion._flashinfer_allreduce_unavailable = original_unavailable
+
+    def test_static_fp8_quant_patterns_match_baseline(self):
+        if not torch.cuda.is_available():
+            self.skipTest("FlashInfer allreduce custom op is CUDA-only")
+
+        fake_comm = _FakeFlashInferComm()
+        manager = fusion.FlashInferWorkspaceManager()
+        manager.workspace = _FakeWorkspace("trtllm", 2)
+        manager.initialized = True
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        manager_key = "flashinfer_fusion_moe_tp_workspace"
+        old_manager = buffers.get(manager_key)
+        old_comm = fusion._flashinfer_comm
+        try:
+            buffers[manager_key] = manager
+            fusion._flashinfer_comm = fake_comm
+            x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+            residual = torch.randn_like(x)
+            weight = torch.randn(8, device="cuda", dtype=torch.bfloat16)
+            scale = torch.tensor(0.02, device="cuda")
+            expected_norm, expected_residual = (
+                _torch_allreduce_residual_rmsnorm_baseline(x, residual, weight, 2, 1e-6)
+            )
+
+            with (
+                patch.object(fusion, "is_flashinfer_available", return_value=True),
+                get_parallel().override(moe_tp_size=2, moe_ep_size=1),
+                patch.object(fusion, "ensure_workspace_initialized", return_value=True),
+            ):
+                for keep_bf16 in (False, True):
+                    quant, residual_out, norm = (
+                        fusion.try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+                            x,
+                            residual,
+                            weight,
+                            scale,
+                            keep_bf16=keep_bf16,
+                            use_attn_tp_group=False,
+                        )
+                    )
+                    torch.testing.assert_close(residual_out, expected_residual)
+                    torch.testing.assert_close(
+                        quant.float(),
+                        (expected_norm / scale).to(torch.float8_e4m3fn).float(),
+                    )
+                    self.assertEqual(norm.numel() > 0, keep_bf16)
+                    if keep_bf16:
+                        torch.testing.assert_close(norm, expected_norm)
+        finally:
+            fusion._flashinfer_comm = old_comm
+            if old_manager is None:
+                buffers.pop(manager_key, None)
+            else:
+                buffers[manager_key] = old_manager
 
 
 _GROUP_KEY = ("device_group", "cpu_group")

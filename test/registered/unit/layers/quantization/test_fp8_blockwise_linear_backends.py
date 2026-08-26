@@ -265,6 +265,51 @@ class TestModeloptFp8PerTensorLinear(_LinearBackendCheck):
     def test_auto(self):
         self._check_backend("auto", ["auto"], PER_TENSOR_SHAPES, self._build_layer)
 
+    def test_prequantized_input_skips_static_quant(self):
+        layer, _ = self._build_layer(512, 512)
+        layer.quant_method.process_weights_after_loading(layer)
+        # Exercise the generic scaled-mm/CUTLASS route here. The FlashInfer BMM
+        # helper has its own dispatch test; separating them makes a failure
+        # identify which consumer mishandled the pre-quantized activation.
+        layer.use_flashinfer_bmm = False
+        x = torch.randn((8, 512), device="cuda", dtype=torch.bfloat16) / 10
+        qx, scale = fp8_utils.static_quant_fp8(x, layer.input_scale, repeat_scale=False)
+        expected, _ = layer(x)
+
+        with mock.patch.object(
+            fp8_utils,
+            "static_quant_fp8",
+            side_effect=AssertionError("pre-quantized input was quantized again"),
+        ):
+            actual, _ = layer((qx, scale))
+
+        torch.testing.assert_close(actual, expected, rtol=5e-2, atol=1e-1)
+
+    def test_prequantized_flashinfer_bmm_dispatch(self):
+        qx = torch.zeros((8, 512), device="cuda", dtype=torch.float8_e4m3fn)
+        weight = torch.zeros((512, 512), device="cuda", dtype=torch.float8_e4m3fn)
+        input_scale = torch.ones(1, device="cuda")
+        weight_scale = torch.ones(1, device="cuda")
+        expected = torch.zeros((8, 512), device="cuda", dtype=torch.bfloat16)
+
+        with (
+            mock.patch.object(
+                fp8_utils,
+                "static_quant_fp8",
+                side_effect=AssertionError("pre-quantized input was quantized again"),
+            ),
+            mock.patch.object(
+                fp8_utils, "flashinfer_bmm_fp8", return_value=expected
+            ) as bmm,
+        ):
+            actual = fp8_utils.apply_fp8_linear_bmm_flashinfer(
+                qx, weight, weight_scale, input_scale
+            )
+
+        torch.testing.assert_close(actual, expected)
+        self.assertEqual(bmm.call_args.args[0].data_ptr(), qx.data_ptr())
+        self.assertEqual(bmm.call_args.args[-1], torch.bfloat16)
+
 
 if __name__ == "__main__":
     unittest.main()

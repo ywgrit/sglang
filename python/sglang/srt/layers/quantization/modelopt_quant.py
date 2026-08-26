@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import regex as re
 import torch
@@ -605,10 +605,32 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
+        if isinstance(x, tuple):
+            if self.use_marlin:
+                raise TypeError("FP8 Marlin cannot consume pre-quantized input")
+            x, input_scale = x
+            if layer.use_flashinfer_bmm:
+                return apply_fp8_linear_bmm_flashinfer(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    input_scale=input_scale,
+                    bias=bias,
+                    output_dtype=layer.orig_dtype,
+                )
+            return apply_fp8_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=input_scale,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                pre_quant_output_dtype=layer.orig_dtype,
+            )
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
