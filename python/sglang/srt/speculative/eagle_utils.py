@@ -61,6 +61,14 @@ elif _is_cpu:
     from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
 
 
+def _is_logits_rejection_shape_profitable(batch_size: int, num_slots: int) -> bool:
+    # H20 eager and CUDA Graph sweeps show that small verify grids do not
+    # amortize block-stat generation and repeated logits exponentiation. At 16
+    # rows and above, all measured batch/slot combinations beat the softmax
+    # path; smaller grids keep the existing latency-optimized implementation.
+    return batch_size * num_slots >= 16
+
+
 def per_step_draft_out_cache_loc(
     out_cache_loc: torch.Tensor,
     batch_size: int,
@@ -677,6 +685,7 @@ def eagle_sample(
     import torch.nn.functional as F
 
     from sglang.srt.distributed import get_tp_group
+    from sglang.srt.environ import envs
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
@@ -688,7 +697,11 @@ def eagle_sample(
         SIMULATE_ACC_TOKEN_MODE,
         generate_simulated_accept_index,
     )
-    from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
+    from sglang.srt.utils.async_probe import (
+        maybe_assert_async,
+        maybe_detect_nan,
+        sanitize_nan_logits,
+    )
 
     device = batch.device
     if batch.forward_mode.is_idle():
@@ -778,6 +791,7 @@ def eagle_sample(
         )
 
         from sglang.kernels.ops.speculative.reject_sampling import (
+            chain_speculative_sampling_from_logits_triton,
             chain_speculative_sampling_triton,
         )
 
@@ -788,49 +802,26 @@ def eagle_sample(
             if use_rejection_sampling
             else tree_speculative_sampling_target_only
         )
-
-        # These full-vocabulary matrices are consumed by the sampling kernel
-        # within this step. Returned tensors were allocated before the scope,
-        # so the next CUDA graph replay may safely reclaim these borrowed bytes.
-        with borrow_graph_pool(user="EAGLE probability borrow"):
-            expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, verify_input.draft_token_num, dim=0
-            )  # (bs * num_draft_tokens, 1)
-
-            target_probs = F.softmax(
-                next_token_logits / expanded_temperature, dim=-1
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-            if sampling_info.need_top_k_sampling:
-                target_probs = top_k_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                    ),
-                )  # (bs * num_draft_tokens, vocab_size)
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_k_renorm"
-                )
-            if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                    ),
-                )
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_p_renorm"
-                )
-            target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-            draft_probs = (
-                verify_input.draft_probs
-                if use_rejection_sampling
-                else torch.zeros_like(target_probs)
+        use_logits_rejection_sampling = (
+            use_rejection_sampling
+            and _is_cuda
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_top_p_sampling
+            and _is_logits_rejection_shape_profitable(
+                candidates.shape[0], candidates.shape[1]
             )
+        )
+
+        # Full-probability fallback tensors and logits-path block statistics are
+        # consumed within this step. Returned tensors were allocated before the
+        # scope, so the next CUDA graph replay may reclaim these borrowed bytes.
+        with borrow_graph_pool(user="EAGLE probability borrow"):
+            draft_probs = verify_input.draft_probs
             # Defense-in-depth behind the spec_hook startup allowlist: validate
             # the actual kernel inputs before the Triton kernel.
             if use_rejection_sampling and (
-                draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+                draft_probs is None
+                or draft_probs.shape[-1] != next_token_logits.shape[-1]
             ):
                 raise ValueError(
                     "Rejection sampling requires a target-vocab draft proposal "
@@ -845,7 +836,7 @@ def eagle_sample(
                 candidates=candidates,
                 device=device,
             )
-            sampling_fn(
+            sampling_kwargs = dict(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=num_correct_drafts,  # mutable
@@ -856,23 +847,73 @@ def eagle_sample(
                 retrive_next_sibling=verify_input.retrieve_next_sibling,
                 uniform_samples=coins,
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
                 threshold_single=get_spec().speculative_accept_threshold_single,
                 threshold_acc=get_spec().speculative_accept_threshold_acc,
                 deterministic=True,
             )
-            del (
-                expanded_temperature,
-                target_probs,
-                draft_probs,
-                coins,
-                coins_for_final_sampling,
-            )
+            if use_logits_rejection_sampling:
+                target_block_stats = chain_speculative_sampling_from_logits_triton(
+                    target_logits=next_token_logits,
+                    temperatures=sampling_info.temperatures,
+                    draft_probs=draft_probs,
+                    **sampling_kwargs,
+                )
+                if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+                    row_sumexp = target_block_stats[1].sum(dim=-1)
+                    maybe_assert_async(
+                        (torch.isfinite(row_sumexp) & (row_sumexp > 0)).all(),
+                        "Invalid logits rejection normalization mass",
+                    )
+            else:
+                expanded_temperature = torch.repeat_interleave(
+                    sampling_info.temperatures,
+                    verify_input.draft_token_num,
+                    dim=0,
+                )  # (bs * num_draft_tokens, 1)
+                target_probs = F.softmax(
+                    next_token_logits / expanded_temperature, dim=-1
+                )  # (bs * num_draft_tokens, vocab_size)
+                maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+                if sampling_info.need_top_k_sampling:
+                    target_probs = top_k_renorm_prob(
+                        target_probs,
+                        torch.repeat_interleave(
+                            sampling_info.top_ks,
+                            verify_input.draft_token_num,
+                            dim=0,
+                        ),
+                    )  # (bs * num_draft_tokens, vocab_size)
+                    maybe_detect_nan(
+                        target_probs, "v2 verify: target_probs after top_k_renorm"
+                    )
+                if sampling_info.need_top_p_sampling:
+                    target_probs = top_p_renorm_prob(
+                        target_probs,
+                        torch.repeat_interleave(
+                            sampling_info.top_ps,
+                            verify_input.draft_token_num,
+                            dim=0,
+                        ),
+                    )
+                    maybe_detect_nan(
+                        target_probs, "v2 verify: target_probs after top_p_renorm"
+                    )
+                target_probs = target_probs.reshape(
+                    bs, verify_input.draft_token_num, -1
+                )
+                if not use_rejection_sampling:
+                    draft_probs = torch.zeros_like(target_probs)
+                sampling_fn(
+                    target_probs=target_probs,
+                    draft_probs=draft_probs,
+                    **sampling_kwargs,
+                )
+                del expanded_temperature, target_probs
+            del draft_probs, coins, coins_for_final_sampling
 
         # Sync sampling results across TP ranks: different GPUs may
-        # produce slightly different target_probs due to floating-point
-        # non-determinism in softmax/top_k/top_p, causing different
+        # produce slightly different sampling results due to floating-point
+        # non-determinism in normalization/top_k/top_p, causing different
         # sampled tokens. Broadcast from rank 0 to ensure consistency.
         tp_group = (
             get_parallel().attn_tp_group
