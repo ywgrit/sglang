@@ -389,6 +389,20 @@ def flashinfer_per_tensor_fp8_supported() -> bool:
 if flashinfer_per_tensor_fp8_supported():
     from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
 
+    @lru_cache(maxsize=1)
+    def _select_flashinfer_fp8_bmm_backend() -> str:
+        # FlashInfer's cuBLAS FP8 BMM runner crashes on SM90. Prefer its cuDNN
+        # implementation there, while preserving the existing backend elsewhere.
+        if get_device_sm() == 90:
+            try:
+                from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
+            except ImportError:
+                pass
+            else:
+                if CUDNN_AVAILABLE:
+                    return "cudnn"
+        return "cublas"
+
     @register_custom_op(
         op_name="flashinfer_bmm_fp8",
         mutates_args=[],
@@ -410,7 +424,7 @@ if flashinfer_per_tensor_fp8_supported():
             x_scale.reshape(1),
             weight_scale.reshape(1),
             out_dtype,
-            backend="cublas",
+            backend=_select_flashinfer_fp8_bmm_backend(),
         ).view(m, n)
 
 
