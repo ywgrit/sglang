@@ -601,6 +601,34 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             # Marlin uses FP8 weights with unquantized activations.
             del layer.input_scale
 
+        input_scale = getattr(layer, "input_scale", None)
+        layer._relu2_static_fp8_quant_ready = bool(
+            self.quant_config.is_checkpoint_fp8_serialized
+            and not self.use_marlin
+            and not self.use_sm120_gemv
+            and layer.orig_dtype == torch.bfloat16
+            and input_scale is not None
+            and input_scale.numel() == 1
+            and torch.isfinite(input_scale).all().item()
+            and (input_scale > 0).all().item()
+        )
+
+    def can_consume_relu2_static_fp8_quant(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> bool:
+        """Whether ``layer`` can consume fused ReLU2 static-FP8 output."""
+        return bool(
+            getattr(layer, "_relu2_static_fp8_quant_ready", False)
+            and layer.tp_size == 1
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and x.dim() >= 2
+            and x.is_contiguous()
+            and x.numel() > 0
+            and x.shape[-1] == layer.input_size_per_partition
+            and x.device == layer.input_scale.device
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,

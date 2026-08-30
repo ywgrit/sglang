@@ -101,6 +101,15 @@ from sglang.utils import logger
 
 _is_cuda = is_cuda()
 
+
+def _relu2_and_static_quant_fp8(x, input_scale):
+    from sglang.kernels.ops.activation.relu2_fp8_quant import (
+        relu2_and_static_quant_fp8,
+    )
+
+    return relu2_and_static_quant_fp8(x, input_scale)
+
+
 if _is_cuda:
     from sglang.kernels.ops.gemm.fused_a_gemm import (
         fused_a_gemm_weight_eligible,
@@ -148,7 +157,20 @@ class NemotronHMLP(nn.Module):
         x: torch.Tensor,
     ):
         x, _ = self.up_proj(x)
-        x = self.act_fn(x)
+        can_consume = getattr(
+            self.down_proj.quant_method,
+            "can_consume_relu2_static_fp8_quant",
+            None,
+        )
+        if can_consume is not None and can_consume(self.down_proj, x):
+            input_scale = self.down_proj.input_scale
+            x = (
+                _relu2_and_static_quant_fp8(x, input_scale),
+                input_scale,
+                x.dtype,
+            )
+        else:
+            x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
 
